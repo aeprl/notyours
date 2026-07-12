@@ -41,7 +41,7 @@ real-time local session stealer detector for windows.
 
 - always check the integrity of the executables that you download
 - when downloading less-than-legal software, always check that your source is reliable
-- never ever do anything a captcha asks you to do outside its own tab, as alot of malware like [LummaC2](redcanary.com/threat-detection-report/threats/lummac2/) rely on user error to infect your desktop
+- never ever do anything a captcha asks you to do outside its own tab, as alot of malware like [LummaC2](https://redcanary.com/threat-detection-report/threats/amber-albatross/) rely on user error to infect your desktop
 
 ## license
 MIT
