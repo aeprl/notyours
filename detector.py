@@ -99,7 +99,7 @@ PSPAWN_SUSPICIOUS_PARENTS = {
     "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe", "opera.exe",
     "iexplore.exe", "mshta.exe", "wscript.exe", "cscript.exe",
     "wmiprvse.exe", "rundll32.exe", "regsvr32.exe", "acrord32.exe",
-    "foxitreader.exe", "javaw.exe", "python.exe", "pythonw.exe",
+    "foxitreader.exe", "javaw.exe",
     "node.exe", "hh.exe", "certutil.exe",
 }
 
@@ -324,64 +324,34 @@ def hash_file(path):
         return None
 
 def vt_lookup(sha256, callback):
-    """Queue a VT hash lookup through the rate-limited worker (fix 6)."""
+    """Look up a SHA256 hash on VirusTotal. Calls callback(result_str)."""
     if not VT_API_KEY:
-        callback("no key")
+        callback("⚠ No VT API key set — add yours in Settings")
         return
-    enqueue_vt(sha256, callback)
-
-_vt_queue   = []
-_vt_lock    = threading.Lock()
-_vt_running = False
-
-def _vt_worker():
-    global _vt_running
-    while True:
-        with _vt_lock:
-            if not _vt_queue:
-                _vt_running = False
-                return
-            sha, callback = _vt_queue.pop(0)
-        _do_vt_lookup(sha, callback)
-        time.sleep(16)  
-
-def enqueue_vt(sha256, callback):
-    """Queue a VT hash lookup, respecting the free-tier rate limit."""
-    global _vt_running
-    with _vt_lock:
-        _vt_queue.append((sha256, callback))
-        if not _vt_running:
-            _vt_running = True
-            threading.Thread(target=_vt_worker, daemon=True).start()
-
-def _do_vt_lookup(sha256, callback):
-    """Internal: perform the actual VT HTTP request (called by the worker)."""
-    if not VT_API_KEY:
-        callback("no key"); return
-    try:
-        url = f"https://www.virustotal.com/api/v3/files/{sha256}"
-        req = urllib.request.Request(url, headers={"x-apikey": VT_API_KEY})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        stats = data["data"]["attributes"]["last_analysis_stats"]
-        mal   = stats.get("malicious", 0)
-        sus   = stats.get("suspicious", 0)
-        total = sum(stats.values())
-        if mal > 0:
-            callback(f"MALICIOUS {mal}/{total}")
-        elif sus > 0:
-            callback(f"SUSPICIOUS {sus}/{total}")
-        else:
-            callback(f"CLEAN 0/{total}")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            callback("not in VT")
-        elif e.code == 429:
-            callback("rate limited")
-        else:
-            callback(f"VT HTTP {e.code}")
-    except Exception as ex:
-        callback(f"VT error")
+    def _run():
+        try:
+            url = f"https://www.virustotal.com/api/v3/files/{sha256}"
+            req = urllib.request.Request(url, headers={"x-apikey": VT_API_KEY})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            stats = data["data"]["attributes"]["last_analysis_stats"]
+            mal   = stats.get("malicious", 0)
+            sus   = stats.get("suspicious", 0)
+            total = sum(stats.values())
+            if mal > 0:
+                callback(f"🔴 MALICIOUS — {mal}/{total} engines flagged")
+            elif sus > 0:
+                callback(f"🟡 SUSPICIOUS — {sus}/{total} engines flagged")
+            else:
+                callback(f"🟢 CLEAN — 0/{total} engines flagged")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                callback("⚪ Not found in VirusTotal database")
+            else:
+                callback(f"VT error: HTTP {e.code}")
+        except Exception as ex:
+            callback(f"VT error: {ex}")
+    threading.Thread(target=_run, daemon=True).start()
 
 def validate_vt_key(key, callback):
     """Ping VirusTotal with the key to confirm it is valid. callback((ok, message))."""
@@ -608,6 +578,9 @@ def get_reg_run_entries():
 
 def registry_run_monitor():
     known = get_reg_run_entries()
+    if MONITOR_ENABLED["registry"]:
+        for (label, subkey, name), value in known.items():
+            raise_reg_run(label, subkey, name, value)
     while True:
         time.sleep(REG_POLL_INTERVAL)
         if not MONITOR_ENABLED["registry"]:
@@ -890,10 +863,9 @@ class PersistenceHandler(FileSystemEventHandler):
             p = Path(event.src_path)
             folder = os.path.dirname(event.src_path)
             ext = p.suffix.lower()
-            if MONITOR_ENABLED["startup"]:
+            if MONITOR_ENABLED["startup"] and p.is_file():
                 for sf in STARTUP_FOLDERS:
-                    if os.path.abspath(folder).lower().startswith(
-                            os.path.abspath(sf).lower()):
+                    if os.path.abspath(folder).lower().startswith(os.path.abspath(sf).lower()):
                         resolve_alert("Startup Folder", f"New startup item: {p.name}")
                         return
             if MONITOR_ENABLED["archive"] and ext in ARCHIVE_EXTS:
@@ -951,8 +923,17 @@ def powershell_spawn_monitor():
                     if (proc.info['name'] or "").lower() not in ("powershell.exe", "pwsh.exe"):
                         continue
                     ppid = proc.ppid()
+                    if ppid == os.getpid():
+                        continue
                     parent = psutil.Process(ppid) if ppid else None
                     pname = (parent.name().lower() if parent else "")
+                    try:
+                        if (parent
+                                and os.path.basename(parent.exe() or "").lower()
+                                == os.path.basename(sys.executable).lower()):
+                            continue
+                    except Exception:
+                        pass
                     if pname in PSPAWN_SUSPICIOUS_PARENTS:
                         key = (proc.pid, pname)
                         if key in seen:
@@ -1001,43 +982,31 @@ def save_baseline(snap):
         pass
 
 def integrity_monitor():
+
     baseline = load_baseline()
     if baseline is None:
         save_baseline(_snapshot_integrity())
         baseline = load_baseline() or {"run": {}, "startup": {}}
-    alerted_run     = set()
-    alerted_startup = set()
     while True:
         time.sleep(REG_POLL_INTERVAL)
         if not MONITOR_ENABLED["integrity"]:
+            baseline = _snapshot_integrity()
             continue
         current = _snapshot_integrity()
         for rk, val in current["run"].items():
             if rk in baseline["run"] and baseline["run"][rk] != val:
-                if rk not in alerted_run:
-                    alerted_run.add(rk)
-                    old_val = baseline["run"][rk]
-                    raise_alert("HIGH", "Run-Key Integrity",
-                                f"Run-key value changed: {rk}",
-                                f"Old: {old_val}\nNew: {val}\n"
-                                "A stealer may have overwritten an existing entry to masquerade.")
-            elif rk in baseline["run"] and baseline["run"][rk] == val:
-                if rk in alerted_run:
-                    alerted_run.discard(rk)
-                    resolve_alert("Run-Key Integrity", f"Run-key value changed: {rk}")
+                raise_alert("HIGH", "Run-Key Integrity",
+                            f"Run-key value changed: {rk}",
+                            f"Old: {baseline['run'][rk]}\nNew: {val}\n"
+                            "A stealer may have overwritten an existing entry to masquerade.")
         for sf, h in current["startup"].items():
             if sf in baseline["startup"] and baseline["startup"][sf] != h:
-                if sf not in alerted_startup:
-                    alerted_startup.add(sf)
-                    old_h = baseline["startup"][sf]
-                    raise_alert("HIGH", "Startup Integrity",
-                                f"Startup item modified: {os.path.basename(sf)}",
-                                f"Hash changed (old {old_h[:12]} \u2192 new {h[:12]}) \u2014 possible tampering.")
-            elif sf in baseline["startup"] and baseline["startup"][sf] == h:
-                if sf in alerted_startup:
-                    alerted_startup.discard(sf)
-                    resolve_alert("Startup Integrity",
-                                  f"Startup item modified: {os.path.basename(sf)}")
+                raise_alert("HIGH", "Startup Integrity",
+                            f"Startup item modified: {os.path.basename(sf)}",
+                            f"Hash changed (old {baseline['startup'][sf][:12]} → "
+                            f"new {h[:12]}) — possible tampering.")
+        baseline = current
+        save_baseline(baseline)
 
 class ExtensionHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -1080,6 +1049,11 @@ class DropHandler(FileSystemEventHandler):
             if p.name.startswith("__PSScriptPolicyTest_"):
                 return
             if installer_running() or archiver_running():
+                return
+            low = str(p).lower()
+            if (os.path.basename(low) in ("prefs-1.js", "prefs.js")
+                    or "\\mozilla\\" in low or "firefox" in low
+                    or "default-release" in low or "defaultagent" in low):
                 return
             folder = os.path.basename(os.path.dirname(p))
             raise_alert("HIGH", "Executable Drop",
@@ -1154,11 +1128,6 @@ def wallet_monitor():
                             "Crypto wallet data should only be touched by the "
                             "browser/extension it belongs to. A non-browser "
                             "process reading it is a classic stealer behavior.")
-            for key in seen_open - open_now:
-                pid, pname, fp = key
-                resolve_alert("Wallet Access",
-                              f"{pname} (PID {pid}) opened wallet file: "
-                              f"{os.path.basename(fp)}")
             seen_open = open_now
         except Exception:
             pass
@@ -1220,9 +1189,6 @@ def avkill_monitor():
                             "Snake and similar stealers terminate AV / analysis "
                             "tools (avastui.exe, wireshark.exe, …) to evade "
                             "detection.")
-            for name in set(current) - set(seen):
-                resolve_alert("AV Kill Attempt",
-                              f"Security/analysis tool disappeared: {name}")
             seen = current
         except Exception:
             pass
@@ -1444,7 +1410,6 @@ class AlertTable:
         self.canvas.pack(side="left", fill="both", expand=True)
 
         self._scroll_job = None
-        self.body.bind("<Configure>", lambda e: self._schedule_scroll())
         self.canvas.bind("<Configure>", lambda e: self._schedule_scroll())
 
     def _total(self):
@@ -1502,7 +1467,6 @@ class AlertTable:
             content_h = len(self.rows) * 26
 
             self.body.configure(height=content_h)
-            self.canvas.update_idletasks()
             view = self.canvas.winfo_height()
             self.canvas.configure(scrollregion=(0, 0, self._total(), content_h))
             if content_h > view + 1:
@@ -1846,9 +1810,11 @@ class DetectorApp(tk.Tk):
                  fg=TEXT, bg=BG).pack(side="left")
         tk.Label(hdr, text="  Session Stealer Detector", font=("Segoe UI",10),
                  fg=DIM, bg=BG).pack(side="left", pady=(3,0))
+        self._all_monitoring = True
         self.status_dot = tk.Label(hdr, text="● MONITORING", font=("Segoe UI",9,"bold"),
-                                   fg=GREEN, bg=BG)
+                                   fg=GREEN, bg=BG, cursor="hand2")
         self.status_dot.pack(side="right")
+        self.status_dot.bind("<Button-1>", lambda e: self._toggle_all_monitors())
         self.cog_canvas = tk.Canvas(hdr, width=16, height=16, bg=BG,
                                     highlightthickness=0, cursor="hand2")
         draw_icon(self.cog_canvas, "gear", "#9a9a9a")
@@ -1883,10 +1849,14 @@ class DetectorApp(tk.Tk):
             padx=10, pady=4, state="disabled")
         self.dismiss_btn.pack(side="right", padx=(0,6))
 
-        self.active_table = AlertTable(self, self, ACTIVE_COLUMNS)
-        self.past_table  = AlertTable(self, self, ACTIVE_COLUMNS)
-        self.active_table.outer.pack(fill="both", expand=True, padx=20, pady=(6,0))
-        self.past_table.outer.pack_forget()
+        self._table_container = tk.Frame(self, bg=BG)
+        self._table_container.pack(fill="both", expand=True, padx=20, pady=(6,0))
+
+        self.active_table = AlertTable(self._table_container, self, ACTIVE_COLUMNS)
+        self.past_table   = AlertTable(self._table_container, self, ACTIVE_COLUMNS)
+        self.active_table.outer.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.past_table.outer.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.active_table.outer.lift()
 
         bar = tk.Frame(self, bg="#161616", pady=6)
         bar.pack(fill="x", side="bottom")
@@ -1944,7 +1914,6 @@ class DetectorApp(tk.Tk):
         win.configure(bg=BG)
         win.resizable(False, False)
         win.transient(self)
-        win.grab_set()
         _dark_titlebar(win)
         win.bind("<Map>", lambda e: _dark_titlebar(win))
         self._settings_win = win
@@ -2022,16 +1991,27 @@ class DetectorApp(tk.Tk):
         self._current_table().canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         return "break"
 
+    def _toggle_all_monitors(self):
+        """Master kill switch — pauses or resumes ALL monitors at once."""
+        self._all_monitoring = not self._all_monitoring
+        for key in MONITOR_ENABLED:
+            MONITOR_ENABLED[key] = self._all_monitoring
+        for key, var in self.monitor_vars.items():
+            var.set(self._all_monitoring)
+        save_config()
+        if self._all_monitoring:
+            self.status_dot.config(text="● MONITORING", fg=GREEN)
+        else:
+            self.status_dot.config(text="○ PAUSED", fg="#e8503a")
+
     def _switch_tab(self, show_past):
         self.showing_past = show_past
         if show_past:
-            self.active_table.outer.pack_forget()
-            self.past_table.outer.pack(fill="both", expand=True, padx=20, pady=(6,0))
+            self.past_table.outer.lift()
             self.tab_active_btn.config(bg="#161616", fg=DIM, font=("Segoe UI",9))
             self.tab_past_btn.config(bg="#1e1e1e", fg=TEXT, font=("Segoe UI",9,"bold"))
         else:
-            self.past_table.outer.pack_forget()
-            self.active_table.outer.pack(fill="both", expand=True, padx=20, pady=(6,0))
+            self.active_table.outer.lift()
             self.tab_active_btn.config(bg="#1e1e1e", fg=TEXT, font=("Segoe UI",9,"bold"))
             self.tab_past_btn.config(bg="#161616", fg=DIM, font=("Segoe UI",9))
         self._update_toolbar()
@@ -2110,11 +2090,14 @@ class DetectorApp(tk.Tk):
             self._update_toolbar()
             self._notify(entry)
         elif event_type == "resolved":
-            if entry["id"] in self.active_table.row_by_id:
+            in_active = entry["id"] in self.active_table.row_by_id
+            in_past   = entry["id"] in self.past_table.row_by_id
+            if in_active:
                 self.alert_counts[level] = max(0, self.alert_counts.get(level, 0) - 1)
                 self.past_counts[level]  = self.past_counts.get(level, 0) + 1
                 self.active_table.remove_row(entry)
-                self.past_table.add_row(entry, past=True)
+                if not in_past:
+                    self.past_table.add_row(entry, past=True)
                 self._refresh_cards()
                 self._update_toolbar()
 
