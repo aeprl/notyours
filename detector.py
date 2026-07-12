@@ -324,34 +324,64 @@ def hash_file(path):
         return None
 
 def vt_lookup(sha256, callback):
-    """Look up a SHA256 hash on VirusTotal. Calls callback(result_str)."""
+    """Queue a VT hash lookup through the rate-limited worker (fix 6)."""
     if not VT_API_KEY:
-        callback("⚠ No VT API key set — add yours in Settings")
+        callback("no key")
         return
-    def _run():
-        try:
-            url = f"https://www.virustotal.com/api/v3/files/{sha256}"
-            req = urllib.request.Request(url, headers={"x-apikey": VT_API_KEY})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-            stats = data["data"]["attributes"]["last_analysis_stats"]
-            mal   = stats.get("malicious", 0)
-            sus   = stats.get("suspicious", 0)
-            total = sum(stats.values())
-            if mal > 0:
-                callback(f"🔴 MALICIOUS — {mal}/{total} engines flagged")
-            elif sus > 0:
-                callback(f"🟡 SUSPICIOUS — {sus}/{total} engines flagged")
-            else:
-                callback(f"🟢 CLEAN — 0/{total} engines flagged")
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                callback("⚪ Not found in VirusTotal database")
-            else:
-                callback(f"VT error: HTTP {e.code}")
-        except Exception as ex:
-            callback(f"VT error: {ex}")
-    threading.Thread(target=_run, daemon=True).start()
+    enqueue_vt(sha256, callback)
+
+_vt_queue   = []
+_vt_lock    = threading.Lock()
+_vt_running = False
+
+def _vt_worker():
+    global _vt_running
+    while True:
+        with _vt_lock:
+            if not _vt_queue:
+                _vt_running = False
+                return
+            sha, callback = _vt_queue.pop(0)
+        _do_vt_lookup(sha, callback)
+        time.sleep(16)  
+
+def enqueue_vt(sha256, callback):
+    """Queue a VT hash lookup, respecting the free-tier rate limit."""
+    global _vt_running
+    with _vt_lock:
+        _vt_queue.append((sha256, callback))
+        if not _vt_running:
+            _vt_running = True
+            threading.Thread(target=_vt_worker, daemon=True).start()
+
+def _do_vt_lookup(sha256, callback):
+    """Internal: perform the actual VT HTTP request (called by the worker)."""
+    if not VT_API_KEY:
+        callback("no key"); return
+    try:
+        url = f"https://www.virustotal.com/api/v3/files/{sha256}"
+        req = urllib.request.Request(url, headers={"x-apikey": VT_API_KEY})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        stats = data["data"]["attributes"]["last_analysis_stats"]
+        mal   = stats.get("malicious", 0)
+        sus   = stats.get("suspicious", 0)
+        total = sum(stats.values())
+        if mal > 0:
+            callback(f"MALICIOUS {mal}/{total}")
+        elif sus > 0:
+            callback(f"SUSPICIOUS {sus}/{total}")
+        else:
+            callback(f"CLEAN 0/{total}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            callback("not in VT")
+        elif e.code == 429:
+            callback("rate limited")
+        else:
+            callback(f"VT HTTP {e.code}")
+    except Exception as ex:
+        callback(f"VT error")
 
 def validate_vt_key(key, callback):
     """Ping VirusTotal with the key to confirm it is valid. callback((ok, message))."""
@@ -578,9 +608,6 @@ def get_reg_run_entries():
 
 def registry_run_monitor():
     known = get_reg_run_entries()
-    if MONITOR_ENABLED["registry"]:
-        for (label, subkey, name), value in known.items():
-            raise_reg_run(label, subkey, name, value)
     while True:
         time.sleep(REG_POLL_INTERVAL)
         if not MONITOR_ENABLED["registry"]:
@@ -863,9 +890,10 @@ class PersistenceHandler(FileSystemEventHandler):
             p = Path(event.src_path)
             folder = os.path.dirname(event.src_path)
             ext = p.suffix.lower()
-            if MONITOR_ENABLED["startup"] and p.is_file():
+            if MONITOR_ENABLED["startup"]:
                 for sf in STARTUP_FOLDERS:
-                    if os.path.abspath(folder).lower().startswith(os.path.abspath(sf).lower()):
+                    if os.path.abspath(folder).lower().startswith(
+                            os.path.abspath(sf).lower()):
                         resolve_alert("Startup Folder", f"New startup item: {p.name}")
                         return
             if MONITOR_ENABLED["archive"] and ext in ARCHIVE_EXTS:
@@ -973,31 +1001,43 @@ def save_baseline(snap):
         pass
 
 def integrity_monitor():
-
     baseline = load_baseline()
     if baseline is None:
         save_baseline(_snapshot_integrity())
         baseline = load_baseline() or {"run": {}, "startup": {}}
+    alerted_run     = set()
+    alerted_startup = set()
     while True:
         time.sleep(REG_POLL_INTERVAL)
         if not MONITOR_ENABLED["integrity"]:
-            baseline = _snapshot_integrity()
             continue
         current = _snapshot_integrity()
         for rk, val in current["run"].items():
             if rk in baseline["run"] and baseline["run"][rk] != val:
-                raise_alert("HIGH", "Run-Key Integrity",
-                            f"Run-key value changed: {rk}",
-                            f"Old: {baseline['run'][rk]}\nNew: {val}\n"
-                            "A stealer may have overwritten an existing entry to masquerade.")
+                if rk not in alerted_run:
+                    alerted_run.add(rk)
+                    old_val = baseline["run"][rk]
+                    raise_alert("HIGH", "Run-Key Integrity",
+                                f"Run-key value changed: {rk}",
+                                f"Old: {old_val}\nNew: {val}\n"
+                                "A stealer may have overwritten an existing entry to masquerade.")
+            elif rk in baseline["run"] and baseline["run"][rk] == val:
+                if rk in alerted_run:
+                    alerted_run.discard(rk)
+                    resolve_alert("Run-Key Integrity", f"Run-key value changed: {rk}")
         for sf, h in current["startup"].items():
             if sf in baseline["startup"] and baseline["startup"][sf] != h:
-                raise_alert("HIGH", "Startup Integrity",
-                            f"Startup item modified: {os.path.basename(sf)}",
-                            f"Hash changed (old {baseline['startup'][sf][:12]} → "
-                            f"new {h[:12]}) — possible tampering.")
-        baseline = current
-        save_baseline(baseline)
+                if sf not in alerted_startup:
+                    alerted_startup.add(sf)
+                    old_h = baseline["startup"][sf]
+                    raise_alert("HIGH", "Startup Integrity",
+                                f"Startup item modified: {os.path.basename(sf)}",
+                                f"Hash changed (old {old_h[:12]} \u2192 new {h[:12]}) \u2014 possible tampering.")
+            elif sf in baseline["startup"] and baseline["startup"][sf] == h:
+                if sf in alerted_startup:
+                    alerted_startup.discard(sf)
+                    resolve_alert("Startup Integrity",
+                                  f"Startup item modified: {os.path.basename(sf)}")
 
 class ExtensionHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -1114,6 +1154,11 @@ def wallet_monitor():
                             "Crypto wallet data should only be touched by the "
                             "browser/extension it belongs to. A non-browser "
                             "process reading it is a classic stealer behavior.")
+            for key in seen_open - open_now:
+                pid, pname, fp = key
+                resolve_alert("Wallet Access",
+                              f"{pname} (PID {pid}) opened wallet file: "
+                              f"{os.path.basename(fp)}")
             seen_open = open_now
         except Exception:
             pass
@@ -1175,6 +1220,9 @@ def avkill_monitor():
                             "Snake and similar stealers terminate AV / analysis "
                             "tools (avastui.exe, wireshark.exe, …) to evade "
                             "detection.")
+            for name in set(current) - set(seen):
+                resolve_alert("AV Kill Attempt",
+                              f"Security/analysis tool disappeared: {name}")
             seen = current
         except Exception:
             pass
