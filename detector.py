@@ -9,8 +9,6 @@ import datetime
 import threading
 import subprocess
 
-# Suppress the console window spawned by the powershell subprocess calls below
-# (Windows-only; falls back to 0 on other platforms).
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 import ctypes
 import shutil
@@ -27,9 +25,6 @@ from watchdog.events import FileSystemEventHandler
 import pystray
 from PIL import Image
 
-# pystray forwards tray-icon clicks to on_click, but never reports clicks on the
-# notification balloon. Patch _on_notify so a balloon click also fires a callback.
-# NIN_BALLOONUSERCLICK == WM_USER + 5 (stable Win32 value).
 _NIN_BALLOONUSERCLICK = 0x0405
 try:
     _orig_on_notify = pystray._win32.Icon._on_notify
@@ -44,8 +39,6 @@ try:
 except Exception:
     pass
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-
 BROWSER_PROFILE_PATHS = {
     "Chrome":  Path(os.environ.get("LOCALAPPDATA","")) / "Google/Chrome/User Data/Default",
     "Brave":   Path(os.environ.get("LOCALAPPDATA","")) / "BraveSoftware/Brave-Browser/User Data/Default",
@@ -58,7 +51,6 @@ SUSPICIOUS_OUTBOUND_PROCESSES = {"powershell.exe","cmd.exe","wscript.exe","cscri
 WMI_POLL_INTERVAL  = 30
 TASK_POLL_INTERVAL = 60
 
-# ── NEW MONITORS: persistence / staging / anomaly ──────────────────────────
 REG_RUN_KEYS = [
     (winreg.HKEY_CURRENT_USER, "HKCU",
      r"Software\Microsoft\Windows\CurrentVersion\Run"),
@@ -99,12 +91,9 @@ TEMP_WATCH_DIRS = [d for d in [
 REG_POLL_INTERVAL    = 30
 DEFENDER_POLL_INTERVAL = 30
 DNS_POLL_INTERVAL    = 30
-DNS_SPIKE_MIN    = 15    # absolute floor before a spike can fire
-DNS_SPIKE_FACTOR = 2.5   # current >= baseline * factor => spike
+DNS_SPIKE_MIN    = 15
+DNS_SPIKE_FACTOR = 2.5
 
-# ── PowerShell-spawn heuristic (#6) ───────────────────────────────────────
-# Parents that should NEVER spawn PowerShell. Covers the fake-CAPTCHA /
-# macro-delivery chain (Office / browser / mshta spawning powershell).
 PSPAWN_SUSPICIOUS_PARENTS = {
     "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "msaccess.exe",
     "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe", "opera.exe",
@@ -114,7 +103,6 @@ PSPAWN_SUSPICIOUS_PARENTS = {
     "node.exe", "hh.exe", "certutil.exe",
 }
 
-# ── Browser extension directories (#8) ───────────────────────────────────────
 def _extension_dirs():
     dirs = []
     la = os.environ.get("LOCALAPPDATA")
@@ -131,7 +119,6 @@ def _extension_dirs():
     return dirs
 EXTENSION_DIRS = _extension_dirs()
 
-# ── Executable-drop heuristic (#9) ──────────────────────────────────────────
 DROP_EXTS = {".exe", ".dll", ".bat", ".vbs", ".ps1", ".js", ".jse",
              ".scr", ".com", ".cmd"}
 DROP_WATCH_DIRS = []
@@ -142,21 +129,13 @@ for d in list(TEMP_WATCH_DIRS) + [
 INSTALLER_EXES = {"setup.exe", "install.exe", "uninst.exe", "msiexec.exe",
                     "nsis.exe", "innoextract.exe", "spoon.exe"} | ARCHIVER_EXES
 
-# ── TypeLib hijack (#10) ────────────────────────────────────────────────
 TYPELIB_KEY = (winreg.HKEY_CURRENT_USER, "HKCU",
                  r"Software\Classes\TypeLib")
 
-# ── Integrity baseline (#7) ───────────────────────────────────────────────
 BASELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline.json")
 if getattr(sys, "frozen", False):
     BASELINE_PATH = os.path.join(os.path.dirname(sys.executable), "baseline.json")
 
-# ── Crypto-wallet access (#11) ────────────────────────────────
-# watchdog can only see create/modify/delete, not reads; so watch reads via
-# psutil open_files() for non-browser processes touching wallet files.
-# Matching is kept tight: an EXACT wallet filename, or a file inside a known
-# wallet DIRECTORY. Generic substrings ("vault", "seed", "key") were removed
-# because unrelated apps (Adobe CC "vault", GitHub, Steam) triggered them.
 WALLET_FILES = {"wallet.dat", "wallet.json", "wallet.wallet", ".wallet",
                  "wallet_keys.json", "mnemonic.txt", "seed.txt", "keystore"}
 WALLET_DIRS = ("bitcoin", "litecoin", "dogecoin", "dash", "monero", "zcash",
@@ -164,7 +143,7 @@ WALLET_DIRS = ("bitcoin", "litecoin", "dogecoin", "dash", "monero", "zcash",
                 "coinomi", "wasabi", "samourai", "multibit", "armory",
                 "ethereum", "keystore", "ledger live",
                 "trezor", "crypto wallets", "crypto-wallets")
-# Narrow path-substring markers (MetaMask's dir is a hash ID, so match by name/id).
+
 WALLET_PATH_INCLUDES = ("metamask",
                           "nkbihfbeogaeaoehlefnkodbefgpgknn",
                           "localextensionsettings")
@@ -185,16 +164,12 @@ def _is_wallet_path(path):
         return True
     return any(s in low for s in WALLET_PATH_INCLUDES)
 
-# ── Screenshot-capture (#12) ──────────────────────────────────
 SCREEN_EXTS = {".png",".bmp",".jpg",".jpeg",".gif",".tif",".tiff"}
 SCREEN_TOOLS = {"snippingtool.exe","sharex.exe","greenshot.exe","snagit.exe",
                 "lightshot.exe","picpick.exe","screenpresso.exe","obs.exe",
                 "obs64.exe","onedrive.exe","dropbox.exe","discord.exe"}
 SCREEN_MIN_BYTES = 15000
 
-# ── AV / security-tool kill (#13) ─────────────────────────────
-# Self-termination of notyours cannot be caught post-mortem (the process is
-# already dead); instead we watch security/analysis tools vanishing.
 AV_TOOLS = {"avastui.exe","avastsvc.exe","afwserv.exe","wireshark.exe",
             "ngui.exe","mbam.exe","mbamservice.exe","msmpeng.exe","msmpsvc.exe",
             "nortonsecurity.exe","mcshield.exe","bdagent.exe","kaspersky.exe",
@@ -202,10 +177,8 @@ AV_TOOLS = {"avastui.exe","avastsvc.exe","afwserv.exe","wireshark.exe",
             "securityhealthsystray.exe"}
 AV_POLL = 10
 
-# User-toggleable: when True, known Windows built-in scheduled tasks are suppressed.
 WHITELIST_BUILTIN_TASKS = True
 
-# Per-category monitoring switches (toggleable from the settings cog).
 MONITOR_ENABLED = {"browser": True, "wmi": True, "tasks": True,
                    "process": True, "clipboard": True,
                    "registry": True, "startup": True, "defender": True,
@@ -234,7 +207,6 @@ MONITOR_CATEGORIES = [
     ("avkill",   "AV Kill Attempt"),
 ]
 
-# VirusTotal API key (user can set this)
 VT_API_KEY = ""
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -268,8 +240,6 @@ def save_config():
 
 load_config()
 
-
-# Known-safe Windows built-in scheduled task names (whitelist)
 WINDOWS_BUILTIN_TASKS = {
     "appuriverifierinstall","microsoft-windows-diskdiagnosticdatacollector",
     "storage tiers management initialization","usagedatareceiver","remotepensyncdata available",
@@ -284,7 +254,7 @@ WINDOWS_BUILTIN_TASKS = {
     "reconcilefeatures","microsoft-windows-diskdiagnosticresolver","bitlocker mdm policy refresh",
     "edp app launch task",".net framework ngen v4.0.30319 64",".net framework ngen v4.0.30319",
     "onedrive reporting task","remotepensyncdata available","spaceagent",
-    # add more as needed
+
 }
 
 def is_builtin_task(name):
@@ -293,8 +263,6 @@ def is_builtin_task(name):
                "onedrive","microsoft-windows","windows defender",".net framework",
                "adobe","nvidia","intel","amd","realtek"
            ])
-
-# ─── ALERT STORE ──────────────────────────────────────────────────────────────
 
 alert_lock    = threading.Lock()
 active_alerts = {}
@@ -344,8 +312,6 @@ def resolve_alert(category, message):
     past_alerts.append(entry)
     if alert_callback:
         alert_callback("resolved", entry)
-
-# ─── VIRUSTOTAL ───────────────────────────────────────────────────────────────
 
 def hash_file(path):
     try:
@@ -405,8 +371,6 @@ def validate_vt_key(key, callback):
             callback((None, "can't verify"))
     threading.Thread(target=_run, daemon=True).start()
 
-# ─── FILE WATCHER ─────────────────────────────────────────────────────────────
-
 class BrowserProfileHandler(FileSystemEventHandler):
     def __init__(self, browser_name):
         self.browser_name = browser_name
@@ -451,21 +415,21 @@ def start_file_watchers():
         observer.schedule(handler, folder, recursive=True)
         observer.start()
         observers.append(observer)
-    # Browser-extension directory watch (#8)
+
     ext_handler = ExtensionHandler()
     for folder in EXTENSION_DIRS:
         observer = Observer()
         observer.schedule(ext_handler, folder, recursive=False)
         observer.start()
         observers.append(observer)
-    # Executable / script drop watch (#9)
+
     drop_handler = DropHandler()
     for folder in DROP_WATCH_DIRS:
         observer = Observer()
         observer.schedule(drop_handler, folder, recursive=True)
         observer.start()
         observers.append(observer)
-    # Screenshot-capture watch (#12)
+
     screen_handler = ScreenshotHandler()
     for folder in TEMP_WATCH_DIRS:
         observer = Observer()
@@ -473,8 +437,6 @@ def start_file_watchers():
         observer.start()
         observers.append(observer)
     return observers
-
-# ─── WMI MONITOR ──────────────────────────────────────────────────────────────
 
 def get_wmi_subscriptions():
     found = set()
@@ -507,8 +469,6 @@ def wmi_monitor():
         for name in known - current:
             resolve_alert("WMI Persistence",f"WMI subscription active: '{name}'")
         known = current
-
-# ─── TASK MONITOR ─────────────────────────────────────────────────────────────
 
 def get_scheduled_tasks():
     tasks = set()
@@ -543,8 +503,6 @@ def task_monitor():
             resolve_alert("Scheduled Task", f"New scheduled task: '{task}'")
         known = current
 
-# ─── PROCESS MONITOR ──────────────────────────────────────────────────────────
-
 def process_monitor():
     seen = set()
     while True:
@@ -577,8 +535,6 @@ def process_monitor():
             except Exception: pass
         time.sleep(5)
 
-# ─── CLIPBOARD MONITOR ────────────────────────────────────────────────────────
-
 CRYPTO_PATTERNS = ["1A1z","3J98","bc1q","0x","T9yD","r3GYT"]
 
 def clipboard_monitor(root):
@@ -600,8 +556,6 @@ def clipboard_monitor(root):
                         resolve_alert("Clipboard","Possible crypto address in clipboard — verify it hasn't been swapped")
             except Exception: pass
         time.sleep(2)
-
-# ─── REGISTRY RUN-KEY MONITOR ───────────────────────────────────────────────
 
 def get_reg_run_entries():
     found = {}
@@ -644,11 +598,7 @@ def registry_run_monitor():
                              f"Run-key entry '{name}' in {label}\\{subkey}")
         known = current
 
-# ─── RUN-KEY REPUTATION CHECKER ──────────────────────────────────────
-# Auto-classifies each Registry Run-key entry as Legit / Review / Suspicious /
-# Unknown so genuine software doesn't bury real persistence alerts.
-
-KNOWN_GOOD_RUN = {  # substrings (lowercase) of common, legitimate Run entries
+KNOWN_GOOD_RUN = {
     "onedrive", "discord", "steam", "spotify", "adobe", "googleupdate",
     "google update", "googledrivesync", "skype", "teams", "slack", "dropbox",
     "boxsync", "whatsapp", "signal", "telegram", "itunes", "epicgameslauncher",
@@ -767,9 +717,9 @@ def verify_signature(path):
     fi.pgKnownSubject = None
     wtd = WINTRUST_DATA()
     wtd.cbStruct = ctypes.sizeof(WINTRUST_DATA)
-    wtd.dwUIChoice = 2          # WTD_UI_NONE
+    wtd.dwUIChoice = 2
     wtd.fdwRevocationChecks = 0
-    wtd.dwUnionChoice = 1         # WTD_CHOICE_FILE
+    wtd.dwUnionChoice = 1
     wtd.pFile = ctypes.pointer(fi)
     wtd.dwStateAction = 0
     wtd.dwUIContext = 0
@@ -782,7 +732,7 @@ def verify_signature(path):
         return None
     if rc == 0:
         return "Valid"
-    if (rc & 0xFFFFFFFF) == 0x800B0100:   # TRUST_E_NOSIGNATURE
+    if (rc & 0xFFFFFFFF) == 0x800B0100:
         return "NotSigned"
     return "Unverified"
 
@@ -790,14 +740,13 @@ def check_run_entry(value):
     """Return (verdict, detail) for a Run-key command value."""
     exe, host = parse_run_target(value)
     if host and (not exe or not os.path.exists(exe)):
-        # bare command name (e.g. powershell.exe /cmd.exe) — resolve via PATH
+
         resolved = shutil.which(exe) if exe else None
         if resolved:
             exe = resolved
     if host:
         return ("suspicious", f"{host} launched from Run key: {value[:60]}")
-    # Windows App Execution Aliases (Store apps like Teams) point at a 0-byte
-    # stub under Microsoft\WindowsApps that isn't a real exe — always benign.
+
     if exe and "microsoft\\windowsapps" in os.path.normcase(exe):
         return ("legit", "Windows App Execution Alias (Store app)")
     if not exe or not os.path.exists(exe):
@@ -827,8 +776,6 @@ def raise_reg_run(label, subkey, name, value):
                   exe_path=exe, vt=VERDICT_LABEL[verdict],
                   extra={"run_value": value, "reg_path": reg_path, "reg_value": name})
 
-# ─── DEFENDER EXCLUSION MONITOR ────────────────────────────────────────────
-
 def get_defender_exclusions():
     found = {}
     try:
@@ -845,7 +792,7 @@ def get_defender_exclusions():
     except FileNotFoundError:
         pass
     except Exception:
-        # Reading HKLM Defender exclusions usually requires admin; silently skip.
+
         pass
     return found
 
@@ -867,8 +814,6 @@ def defender_exclusion_monitor():
                 resolve_alert("Defender Exclusion",
                              f"New Defender exclusion path: {name}")
         known = current
-
-# ─── STARTUP FOLDER + ARCHIVE STAGING MONITOR (watchdog) ──────────────────
 
 def archiver_running():
     try:
@@ -929,8 +874,6 @@ class PersistenceHandler(FileSystemEventHandler):
         except Exception:
             pass
 
-# ─── DNS TXT SPIKE MONITOR ──────────────────────────────────────────────────
-
 DNS_MSG = "DNS TXT-record query volume spike"
 
 def get_dns_txt_count():
@@ -966,12 +909,8 @@ def dns_monitor():
             alerted = False
             resolve_alert("DNS Anomaly", DNS_MSG)
 
-# ─── POWERSHELL-SPAWN MONITOR (#6) ──────────────────────────────
-
 def powershell_spawn_monitor():
-    # Flag PowerShell/pwsh whose PARENT is a process that should never
-    # launch a shell (Office / browser / mshta / wmiprvse …) — the
-    # fake-CAPTCHA / macro-delivery chain.
+
     seen = set()
     while True:
         time.sleep(5)
@@ -1002,8 +941,6 @@ def powershell_spawn_monitor():
         alive = {p.pid for p in psutil.process_iter(['pid'])}
         seen = {(pid, p) for (pid, p) in seen if pid in alive}
 
-# ─── INTEGRITY BASELINE (#7) ───────────────────────────────────────
-
 def _snapshot_integrity():
     snap = {"run": {}, "startup": {}, "typelib": []}
     for rk, value in get_reg_run_entries().items():
@@ -1017,8 +954,7 @@ def _snapshot_integrity():
                     snap["startup"][os.path.abspath(fp).lower()] = hash_file(fp)
         except Exception:
             pass
-    # Carry the TypeLib section too so the two baseline writers never
-    # clobber each other's data in the shared baseline file.
+
     snap["typelib"] = list(get_typelib_entries().keys())
     return snap
 
@@ -1037,9 +973,7 @@ def save_baseline(snap):
         pass
 
 def integrity_monitor():
-    # First launch (or missing baseline): snapshot and learn current
-    # Run-key values + startup files, then alert only on CHANGES to
-    # existing entries (stealers often overwrite a legit entry to masquerade).
+
     baseline = load_baseline()
     if baseline is None:
         save_baseline(_snapshot_integrity())
@@ -1065,8 +999,6 @@ def integrity_monitor():
         baseline = current
         save_baseline(baseline)
 
-# ─── BROWSER-EXTENSION MONITOR (#8) ───────────────────────────────
-
 class ExtensionHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory:
@@ -1084,8 +1016,6 @@ class ExtensionHandler(FileSystemEventHandler):
                         f"extensions directory.")
         except Exception:
             pass
-
-# ─── EXECUTABLE-DROP MONITOR (#9) ──────────────────────────────────
 
 def installer_running():
     try:
@@ -1106,7 +1036,7 @@ class DropHandler(FileSystemEventHandler):
             p = Path(event.src_path)
             if p.suffix.lower() not in DROP_EXTS:
                 return
-            # PowerShell's own policy-probe file, auto-created+deleted in Temp.
+
             if p.name.startswith("__PSScriptPolicyTest_"):
                 return
             if installer_running() or archiver_running():
@@ -1118,8 +1048,6 @@ class DropHandler(FileSystemEventHandler):
                         "directory by a non-installer process.")
         except Exception:
             pass
-
-# ─── TYPELIB-HIJACK MONITOR (#10) ──────────────────────────────────
 
 def get_typelib_entries():
     found = {}
@@ -1160,10 +1088,6 @@ def typelib_monitor():
         baseline["typelib"] = list(known)
         save_baseline(baseline)
 
-# ─── CRYPTO-WALLET ACCESS MONITOR (#11) ──────────────────────
-# Catch non-browser processes reading/holding wallet files (watchdog can't
-# see reads, so we poll psutil open_files()).
-
 def wallet_monitor():
     seen_open = set()
     while True:
@@ -1193,8 +1117,6 @@ def wallet_monitor():
             seen_open = open_now
         except Exception:
             pass
-
-# ─── SCREENSHOT-CAPTURE MONITOR (#12) ─────────────────────────
 
 def _proc_running(names):
     try:
@@ -1232,10 +1154,6 @@ class ScreenshotHandler(FileSystemEventHandler):
         except Exception:
             pass
 
-# ─── AV / SECURITY-TOOL KILL MONITOR (#13) ───────────────────
-# We can't detect our own process being terminated (post-mortem), so we watch
-# security / analysis tools vanishing from the process list instead.
-
 def avkill_monitor():
     seen = {}
     while True:
@@ -1261,14 +1179,11 @@ def avkill_monitor():
         except Exception:
             pass
 
-# ─── GUI ──────────────────────────────────────────────────────────────────────
-
 LEVEL_COLORS = {"CRITICAL":"#e8503a","HIGH":"#f5a623","MEDIUM":"#f0c040","INFO":"#6a6a7a"}
 PAST_COLOR   = "#444455"
 VT_COLORS    = {"safe":"#3ddc84","malicious":"#e8503a","suspicious":"#f5a623",
                 "unknown":"#888899","checking":"#aaaacc"}
 
-# ── UI Theme / Layout constants ───────────────────────────────────────────────
 BG          = "#141414"
 CARD_BG    = "#252526"
 CARD_BORDER = "#1c1c1c"
@@ -1479,8 +1394,7 @@ class AlertTable:
         self.body.pack_propagate(False)
         self.canvas.create_window((0,0), window=self.body, anchor="nw")
         self.canvas.pack(side="left", fill="both", expand=True)
-        # Resizing fires <Configure> dozens of times per drag; debounce the
-        # scrollbar/scrollregion recompute so we don't thrash the UI thread.
+
         self._scroll_job = None
         self.body.bind("<Configure>", lambda e: self._schedule_scroll())
         self.canvas.bind("<Configure>", lambda e: self._schedule_scroll())
@@ -1519,8 +1433,7 @@ class AlertTable:
     def _relayout(self):
         self.body.configure(width=self._total())
         self.body.configure(height=max(1, len(self.rows) * 26))
-        # Reposition header widgets in place (do NOT rebuild, or an active drag's
-        # separator would be destroyed mid-drag and the drag would die after a pixel).
+
         x = 0
         for c, lbl, sep in getattr(self, "_hdr", []):
             lbl.place(x=x+6, y=0, width=max(1, c["width"]-6), height=26)
@@ -1539,9 +1452,7 @@ class AlertTable:
     def _update_scrollbar(self):
         try:
             content_h = len(self.rows) * 26
-            # Size the body exactly to its rows and base the scroll region on
-            # that, so there is never empty space to scroll into (no scrolling
-            # above the first alert or below the last one).
+
             self.body.configure(height=content_h)
             self.canvas.update_idletasks()
             view = self.canvas.winfo_height()
@@ -1550,7 +1461,7 @@ class AlertTable:
                 if not self.sb.winfo_ismapped():
                     self.sb.pack(side="right", fill="y")
             else:
-                # Everything fits: no scrollbar, pinned to the top.
+
                 self.canvas.yview_moveto(0.0)
                 if self.sb.winfo_ismapped():
                     self.sb.pack_forget()
@@ -1592,9 +1503,7 @@ class AlertTable:
         frame.bind("<Leave>", _on_leave)
         vt = tk.Label(frame, text=entry.get("vt_status") or "–", bg=ROW_BG, fg=DIM, font=("Segoe UI",8))
         row["cells"]["vt"] = vt; row["bgw"].append(vt)
-        # VirusTotal hashes FILES, so the Check button is only meaningful for actual
-        # executable processes. Everything else (registry run keys, scripts, clipboard,
-        # etc.) gets a greyed/disabled button.
+
         exe_path = entry.get("exe_path")
         is_exe_process = (entry.get("category") == "Suspicious Processes"
                           and exe_path and os.path.isfile(exe_path))
@@ -1614,13 +1523,12 @@ class AlertTable:
         row["cells"]["time"] = t; row["bgw"].append(t)
         def _on_row_click(e, r=row):
             self._toggle(r)
-        # Selection only toggles via the checkbox cell — clicking elsewhere on the
-        # row (e.g. the message) must not select it.
+
         row["cells"]["sel"].bind("<Button-1>", _on_row_click)
         for w in row["cells"].values():
             try:
                 if isinstance(w, tk.Button):
-                    continue   # "Check" button keeps its own action
+                    continue
             except Exception:
                 pass
         self.rows.append(row)
@@ -1709,11 +1617,8 @@ class AlertTable:
         if r:
             r["cells"]["vt"].config(text=(entry.get("vt") or "–")[:40])
 
-
 def _dark_titlebar(win):
-    # Tkinter cannot style the OS title bar natively; on Windows we opt into the
-    # immersive dark title bar via the DWM/uxtheme APIs. Works on any Toplevel.
-    # No-op on other platforms.
+
     if sys.platform != "win32":
         return
     try:
@@ -1721,23 +1626,23 @@ def _dark_titlebar(win):
         user32 = ctypes.windll.user32
         dwmapi = ctypes.windll.dwmapi
         hwnd = int(win.winfo_id())
-        # Climb to the actual top-level window that owns the title bar.
+
         try:
             root = user32.GetAncestor(hwnd, 2)
             if root: hwnd = root
         except Exception:
             pass
-        # Opt the window into dark mode (undocumented uxtheme exports).
+
         try:
             uxtheme = ctypes.windll.uxtheme
             if hasattr(uxtheme, "SetPreferredAppMode"):
-                uxtheme.SetPreferredAppMode(2)  # AllowDark
+                uxtheme.SetPreferredAppMode(2)
             if hasattr(uxtheme, "AllowDarkModeForWindow"):
                 uxtheme.AllowDarkModeForWindow(hwnd, True)
         except Exception:
             pass
         val = ctypes.c_int(1)
-        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (20H1+, then pre-20H1)
+        for attr in (20, 19):
             try:
                 dwmapi.DwmSetWindowAttribute(hwnd, attr,
                                              ctypes.byref(val), ctypes.sizeof(val))
@@ -1745,7 +1650,6 @@ def _dark_titlebar(win):
                 pass
     except Exception:
         pass
-
 
 class DetectorApp(tk.Tk):
     def __init__(self):
@@ -1773,7 +1677,6 @@ class DetectorApp(tk.Tk):
         global alert_callback
         alert_callback = self._on_alert_event
 
-        # ── TRAY / NOTIFICATION STATE ──
         self.tray_icon     = None
         self._in_tray      = False
         self._notif_times  = []
@@ -1784,8 +1687,6 @@ class DetectorApp(tk.Tk):
 
     def _apply_dark_titlebar(self):
         _dark_titlebar(self)
-
-    # ── SYSTEM TRAY ───────────────────────────────────────────────────────────
 
     def _setup_tray(self):
         try:
@@ -1833,14 +1734,8 @@ class DetectorApp(tk.Tk):
                 pass
         self.destroy()
 
-    # ── REGEDIT JUMP ─────────────────────────────────────────────────────────────
-
     def _open_regedit(self, key_path):
-        # regedit requires elevation here, so a plain Popen fails (WinError 740) and
-        # silently does nothing. We write the target into LastKey, then launch an
-        # ELEVATED cmd that closes any open regedit and starts a fresh (elevated)
-        # instance — which reads LastKey and jumps straight to the exact key.
-        # A single UAC prompt appears; if regedit is already closed this still works.
+
         try:
             try:
                 with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
@@ -1857,15 +1752,13 @@ class DetectorApp(tk.Tk):
             shell32.ShellExecuteW.restype = ctypes.c_int
             r = shell32.ShellExecuteW(0, "runas", "cmd.exe", params, None, 1)
             if r <= 32:
-                # Fallback for machines where regedit does NOT need elevation.
+
                 subprocess.Popen(["regedit.exe"], creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
-    # ── NOTIFICATIONS ──────────────────────────────────────────────────────────
 
     def _notify(self, entry):
-        # INFO-level alerts (e.g. legit registry Run keys, built-in tasks) are
-        # just informational — never raise a toast for them.
+
         if entry.get("level") == "INFO":
             return
         if self.tray_icon is None:
@@ -1895,10 +1788,8 @@ class DetectorApp(tk.Tk):
         if not self._notif_times:
             self._spam_notified = False
 
-    # ── BUILD ─────────────────────────────────────────────────────────────────
-
     def _build_ui(self):
-        # Header
+
         hdr = tk.Frame(self, bg=BG)
         hdr.pack(fill="x", padx=20, pady=(14,0))
         if self.logo_img:
@@ -1916,14 +1807,12 @@ class DetectorApp(tk.Tk):
         self.cog_canvas.pack(side="right", padx=(10,0))
         self.cog_canvas.bind("<Button-1>", lambda e: self._open_settings())
 
-        # Stat cards
         cards = tk.Frame(self, bg=BG)
         cards.pack(fill="x", padx=20, pady=12)
         for lvl, color in [("CRITICAL","#e8503a"),("HIGH","#f5a623"),("MEDIUM","#f0c040")]:
             c = self._make_stat_card(cards, lvl, color)
             c.pack(side="left", padx=(0,14), fill="x", expand=True)
 
-        # Tabs + toolbar
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=20, pady=(8,0))
         self.tab_active_btn = tk.Button(top, text="Active Alerts",
@@ -1946,13 +1835,11 @@ class DetectorApp(tk.Tk):
             padx=10, pady=4, state="disabled")
         self.dismiss_btn.pack(side="right", padx=(0,6))
 
-        # Tables
         self.active_table = AlertTable(self, self, ACTIVE_COLUMNS)
         self.past_table  = AlertTable(self, self, ACTIVE_COLUMNS)
         self.active_table.outer.pack(fill="both", expand=True, padx=20, pady=(6,0))
         self.past_table.outer.pack_forget()
 
-        # Footer
         bar = tk.Frame(self, bg="#161616", pady=6)
         bar.pack(fill="x", side="bottom")
         tk.Button(bar, text="↑ Export Alerts", command=self._export, bg="#1e1e1e",
@@ -1982,8 +1869,6 @@ class DetectorApp(tk.Tk):
         self.bind_all("<MouseWheel>", self._on_wheel)
         self.bind_all("<Button-1>", self._clear_api_selection)
 
-    # ── HELPERS ───────────────────────────────────────────────────────────────
-
     def _make_stat_card(self, parent, level, color):
         card = tk.Frame(parent, bg=CARD_BG, highlightbackground=CARD_BORDER, highlightthickness=1)
         tk.Label(card, text=level, fg=color, bg=CARD_BG, font=("Segoe UI",10,"bold")).pack(pady=(14,2))
@@ -2000,8 +1885,6 @@ class DetectorApp(tk.Tk):
             act, past = self.stat_cards[lvl]
             act.config(text=str(self.alert_counts.get(lvl,0)))
             past.config(text="PAST " + str(self.past_counts.get(lvl,0)))
-
-    # ── SETTINGS (cog) ─────────────────────────────────────────────────────────
 
     def _open_settings(self):
         self._spin_cog()
@@ -2047,7 +1930,7 @@ class DetectorApp(tk.Tk):
             self.vt_entry.delete(0,"end"); self.vt_entry.config(fg="#cfcfcf")
 
     def _clear_api_selection(self, e):
-        # Clicking anywhere outside the API key field clears its text selection.
+
         w = e.widget
         try:
             if w is self.vt_entry or str(w).startswith(str(self.vt_entry) + "."):
@@ -2064,7 +1947,7 @@ class DetectorApp(tk.Tk):
             self.vt_entry.insert(0,"VT API Key"); self.vt_entry.config(fg="#8a8a8a")
             self.vt_status.config(text="", fg=DIM)
         else:
-            self._vt_commit()   # remember the key locally, but do NOT re-ping
+            self._vt_commit()
 
     def _vt_commit(self):
         global VT_API_KEY
@@ -2072,7 +1955,7 @@ class DetectorApp(tk.Tk):
         save_config()
 
     def _vt_save(self, e):
-        # Called only on Enter: remember the key AND ping once to confirm it works.
+
         self._vt_commit()
         if VT_API_KEY:
             self.vt_status.config(text="checking…", fg=DIM)
@@ -2104,8 +1987,6 @@ class DetectorApp(tk.Tk):
             self.tab_active_btn.config(bg="#1e1e1e", fg=TEXT, font=("Segoe UI",9,"bold"))
             self.tab_past_btn.config(bg="#161616", fg=DIM, font=("Segoe UI",9))
         self._update_toolbar()
-
-    # ── SELECTION ─────────────────────────────────────────────────────────────
 
     def _on_selection_changed(self):
         self._update_toolbar()
@@ -2139,8 +2020,6 @@ class DetectorApp(tk.Tk):
         self._update_toolbar()
         self.select_all_var.set(False)
 
-    # ── VT ────────────────────────────────────────────────────────────────────
-
     def _vt_click(self, entry):
         if entry["category"] == "Registry Run Key":
             val = entry.get("run_value")
@@ -2171,8 +2050,6 @@ class DetectorApp(tk.Tk):
         self.active_table.update_vt(entry)
         self.past_table.update_vt(entry)
 
-    # ── ALERT EVENTS ──────────────────────────────────────────────────────────
-
     def _on_alert_event(self, event_type, entry):
         self.after(0, lambda: self._handle_alert(event_type, entry))
 
@@ -2193,25 +2070,19 @@ class DetectorApp(tk.Tk):
                 self._refresh_cards()
                 self._update_toolbar()
 
-    # ── WHITELIST TOGGLE ──────────────────────────────────────────────────────
-
     def _toggle_whitelist(self):
         global WHITELIST_BUILTIN_TASKS
         WHITELIST_BUILTIN_TASKS = self.whitelist_var.get()
         save_config()
         if WHITELIST_BUILTIN_TASKS:
-            # When re-enabling, resolve any currently-shown built-in (INFO) task alerts.
-            # Take a snapshot first so we don't mutate the dict while iterating it.
+
             builtin_entries = [
                 e for e in list(active_alerts.values())
                 if e["category"] == "Scheduled Task" and e["level"] == "INFO"
             ]
             for entry in builtin_entries:
-                # resolve_alert already checks if the key still exists, so this is safe
-                # even if the alert was dismissed between the snapshot and now.
-                resolve_alert("Scheduled Task", entry["message"])
 
-    # ── EXPORT ────────────────────────────────────────────────────────────────
+                resolve_alert("Scheduled Task", entry["message"])
 
     def _export(self):
         if getattr(sys, "frozen", False):
@@ -2241,8 +2112,6 @@ class DetectorApp(tk.Tk):
 
     def on_close(self):
         self._quit()
-
-# ─── ENTRY ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = DetectorApp()
