@@ -372,71 +372,106 @@ def validate_vt_key(key, callback):
             callback((None, "can't verify"))
     threading.Thread(target=_run, daemon=True).start()
 
+_open_files_queue = []
+_open_files_lock  = threading.Lock()
+
+def _open_files_checker():
+    """Background thread: drain _open_files_queue and do the expensive open_files() check."""
+    while True:
+        time.sleep(1)  
+        with _open_files_lock:
+            items = list(_open_files_queue)
+            _open_files_queue.clear()
+        if not items or not MONITOR_ENABLED["browser"]:
+            continue
+        seen_paths = set()
+        for filepath, browser_name in items:
+            fp_low = filepath.lower()
+            if fp_low in seen_paths:
+                continue
+            seen_paths.add(fp_low)
+            try:
+                for proc in psutil.process_iter(['pid','name','exe']):
+                    try:
+                        pname = (proc.info['name'] or "").lower()
+                        if pname in TRUSTED_BROWSER_EXES:
+                            continue
+                        for f in proc.open_files():
+                            if fp_low in f.path.lower():
+                                raise_alert("HIGH","Browser Profile Access",
+                                    f"{proc.info['name']} (PID {proc.pid}) reading {Path(filepath).name}",
+                                    f"Browser: {browser_name} | EXE: {proc.info.get('exe','unknown')}",
+                                    exe_path=proc.info.get('exe'))
+                                break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except Exception:
+                pass
+
 class BrowserProfileHandler(FileSystemEventHandler):
     def __init__(self, browser_name):
         self.browser_name = browser_name
     def on_modified(self, event):
         if event.is_directory: return
         if Path(event.src_path).name in SENSITIVE_FILES:
-            self._check(event.src_path)
-    def _check(self, filepath):
-        if not MONITOR_ENABLED["browser"]:
-            return
-        try:
-            for proc in psutil.process_iter(['pid','name','exe','open_files']):
-                try:
-                    pname = (proc.info['name'] or "").lower()
-                    if pname in TRUSTED_BROWSER_EXES: continue
-                    for f in proc.open_files():
-                        if filepath.lower() in f.path.lower():
-                            raise_alert("HIGH","Browser Profile Access",
-                                f"{proc.info['name']} (PID {proc.pid}) reading {Path(filepath).name}",
-                                f"Browser: {self.browser_name} | EXE: {proc.info.get('exe','unknown')}",
-                                exe_path=proc.info.get('exe'))
-                except (psutil.NoSuchProcess, psutil.AccessDenied): pass
-        except Exception: pass
+            with _open_files_lock:
+                _open_files_queue.append((event.src_path, self.browser_name))
 
 def start_file_watchers():
     observers = []
+
+    browser_obs = Observer()
     for browser, path in BROWSER_PROFILE_PATHS.items():
         watch_path = path if browser != "Firefox" else path.parent
         if watch_path.exists():
-            observer = Observer()
-            observer.schedule(BrowserProfileHandler(browser), str(watch_path), recursive=True)
-            observer.start()
-            observers.append(observer)
+            browser_obs.schedule(BrowserProfileHandler(browser), str(watch_path), recursive=True)
+    browser_obs.start()
+    observers.append(browser_obs)
+
+    persistence_obs = Observer()
     handler = PersistenceHandler()
-    for folder in STARTUP_FOLDERS:
-        observer = Observer()
-        observer.schedule(handler, folder, recursive=False)
-        observer.start()
-        observers.append(observer)
-    for folder in TEMP_WATCH_DIRS:
-        observer = Observer()
-        observer.schedule(handler, folder, recursive=True)
-        observer.start()
-        observers.append(observer)
+    seen_persistence = set()
+    for folder in STARTUP_FOLDERS + TEMP_WATCH_DIRS:
+        key = os.path.normcase(folder)
+        if key not in seen_persistence and os.path.isdir(folder):
+            seen_persistence.add(key)
+            recursive = folder not in STARTUP_FOLDERS
+            persistence_obs.schedule(handler, folder, recursive=recursive)
+    persistence_obs.start()
+    observers.append(persistence_obs)
 
-    ext_handler = ExtensionHandler()
-    for folder in EXTENSION_DIRS:
-        observer = Observer()
-        observer.schedule(ext_handler, folder, recursive=False)
-        observer.start()
-        observers.append(observer)
+    if EXTENSION_DIRS:
+        ext_obs = Observer()
+        ext_handler = ExtensionHandler()
+        for folder in EXTENSION_DIRS:
+            ext_obs.schedule(ext_handler, folder, recursive=False)
+        ext_obs.start()
+        observers.append(ext_obs)
 
-    drop_handler = DropHandler()
-    for folder in DROP_WATCH_DIRS:
-        observer = Observer()
-        observer.schedule(drop_handler, folder, recursive=True)
-        observer.start()
-        observers.append(observer)
+    if DROP_WATCH_DIRS:
+        drop_obs = Observer()
+        drop_handler = DropHandler()
+        seen_drop = set()
+        for folder in DROP_WATCH_DIRS:
+            key = os.path.normcase(folder)
+            if key not in seen_drop and os.path.isdir(folder):
+                seen_drop.add(key)
+                drop_obs.schedule(drop_handler, folder, recursive=True)
+        drop_obs.start()
+        observers.append(drop_obs)
 
-    screen_handler = ScreenshotHandler()
-    for folder in TEMP_WATCH_DIRS:
-        observer = Observer()
-        observer.schedule(screen_handler, folder, recursive=True)
-        observer.start()
-        observers.append(observer)
+    if TEMP_WATCH_DIRS:
+        screen_obs = Observer()
+        screen_handler = ScreenshotHandler()
+        seen_screen = set()
+        for folder in TEMP_WATCH_DIRS:
+            key = os.path.normcase(folder)
+            if key not in seen_screen and os.path.isdir(folder):
+                seen_screen.add(key)
+                screen_obs.schedule(screen_handler, folder, recursive=True)
+        screen_obs.start()
+        observers.append(screen_obs)
+
     return observers
 
 def get_wmi_subscriptions():
@@ -504,11 +539,6 @@ def task_monitor():
             resolve_alert("Scheduled Task", f"New scheduled task: '{task}'")
         known = current
 
-# ---- Amber Albatross / PyInstaller stealer detection -----------------------
-# PyArmor-obfuscated PyInstaller payloads ship as a Python interpreter
-# (python.exe / pythonw.exe / pythonservice.exe) launched from a
-# user-writable path (AppData, Temp, Downloads) or by a PUP installer
-# (PC App Store, Bit Guardian, fake PDF utilities).
 PYTHON_EXE_NAMES = ("python.exe", "pythonw.exe", "python3.exe", "python38.exe",
                    "python39.exe", "python310.exe", "python311.exe",
                    "python312.exe", "python313.exe", "python314.exe",
@@ -588,7 +618,6 @@ def process_monitor():
                 for proc in psutil.process_iter(['pid','name','exe']):
                     try:
                         pname = (proc.info['name'] or "").lower()
-                        # self-exclusion: skip our own process / exe
                         if proc.pid == os.getpid():
                             continue
                         pexe = proc.info.get('exe') or ""
@@ -597,20 +626,17 @@ def process_monitor():
                                 continue
                         except Exception:
                             pass
-                        # get parent name for parent-based heuristics
                         try:
                             parent = proc.parent()
                             ppname = parent.name().lower() if parent else ""
                         except Exception:
                             ppname = ""
-                        # get cmdline for cmdline-based heuristics
                         try:
                             cmdline_list = proc.cmdline()
                             cmdline_str = " ".join(cmdline_list).lower()
                         except Exception:
                             cmdline_list = []
                             cmdline_str = ""
-                        # (1) outbound network from known script/LOLbin hosts
                         if pname in SUSPICIOUS_OUTBOUND_PROCESSES:
                             try:
                                 conns = proc.net_connections(kind='inet')
@@ -626,7 +652,6 @@ def process_monitor():
                                             f"{proc.info['name']} (PID {proc.pid}) → {conn.raddr.ip}:{conn.raddr.port}",
                                             "Suspicious process making outbound connection.",
                                             exe_path=pexe)
-                        # (2) Amber Albatross / PyInstaller-style Python payloads
                         if _is_suspicious_python(pname, pexe):
                             pn = ppname
                             level, reason = _python_alert_level(pn, pexe)
@@ -637,7 +662,6 @@ def process_monitor():
                                 raise_alert(level, "Suspicious Processes",
                                     f"Python interpreter '{pname}' running from {pexe}",
                                     reason, exe_path=pexe)
-                        # (3) cmdline and path-based threat heuristics
                         pk = (proc.pid, "msiexec_remote")
                         if pname == "msiexec.exe" and pk not in pattern_alerts:
                             for part in cmdline_list:
@@ -2173,7 +2197,15 @@ class DetectorApp(tk.Tk):
                            activeforeground=TEXT, font=("Segoe UI",9)).pack(anchor="w", padx=16, pady=3)
         tk.Label(win, text="Disable a category to stop its alerts.",
                  bg=BG, fg=DIM2, font=("Segoe UI",8)).pack(padx=16, pady=(8,14))
-        win.protocol("WM_DELETE_WINDOW", lambda: (win.destroy(), setattr(self, "_settings_win", None)))
+        def _on_settings_close():
+            if self._cog_anim is not None:
+                try: self.after_cancel(self._cog_anim)
+                except Exception: pass
+                self._cog_anim = None
+            draw_icon(self.cog_canvas, "gear", "#9a9a9a", 0)
+            win.destroy()
+            self._settings_win = None
+        win.protocol("WM_DELETE_WINDOW", _on_settings_close)
 
     def _set_monitor(self, key):
         MONITOR_ENABLED[key] = self.monitor_vars[key].get()
@@ -2183,11 +2215,13 @@ class DetectorApp(tk.Tk):
         if self._cog_anim is not None:
             try: self.after_cancel(self._cog_anim)
             except Exception: pass
+            self._cog_anim = None
         draw_icon(self.cog_canvas, "gear", "#9a9a9a", angle)
         if angle < 360:
-            self._cog_anim = self.after(18, self._spin_cog, angle + 18)
+            self._cog_anim = self.after(40, self._spin_cog, angle + 20)
         else:
             self._cog_anim = None
+            draw_icon(self.cog_canvas, "gear", "#9a9a9a", 0)
 
     def _vt_focus_in(self, e):
         if self.vt_entry.get() == "VT API Key":
@@ -2381,6 +2415,7 @@ class DetectorApp(tk.Tk):
 
     def start_monitors(self):
         self.observers = start_file_watchers()
+        threading.Thread(target=_open_files_checker, daemon=True).start()
         for fn in [wmi_monitor, task_monitor, process_monitor,
                    registry_run_monitor, defender_exclusion_monitor, dns_monitor,
                    powershell_spawn_monitor, integrity_monitor,
