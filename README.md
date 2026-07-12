@@ -37,5 +37,11 @@ real-time local session stealer detector for windows.
 - no piece of information collected in notyours goes anywhere outside of your computer
 - the code is sloppy and heavily vibe coded as i made this quickly being the receiving end of a session hijacking attack
 
+### reminder
+
+- always check the integrity of the executables that you download
+- when downloading less-than-legal software, always check that your source is reliable
+- never ever do anything a captcha asks you to do outside its own tab, as alot of malware like [LummaC2](redcanary.com/threat-detection-report/threats/lummac2/) rely on user error to infect your desktop
+
 ## license
 MIT
