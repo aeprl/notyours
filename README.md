@@ -37,4 +37,5 @@ real-time local session stealer detector for windows.
 - no piece of information collected in notyours goes anywhere outside of your computer
 - the code is sloppy and heavily vibe coded as i made this quickly being the receiving end of a session hijacking attack
 
-
+## license
+MIT
