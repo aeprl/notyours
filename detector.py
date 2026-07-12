@@ -47,7 +47,7 @@ BROWSER_PROFILE_PATHS = {
 }
 SENSITIVE_FILES = ["Cookies","Login Data","Web Data","Local State","sessions.sqlite","key4.db","logins.json"]
 TRUSTED_BROWSER_EXES = {"chrome.exe","brave.exe","msedge.exe","firefox.exe"}
-SUSPICIOUS_OUTBOUND_PROCESSES = {"powershell.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe","regsvr32.exe"}
+SUSPICIOUS_OUTBOUND_PROCESSES = {"powershell.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe","regsvr32.exe","msiexec.exe","curl.exe","finger.exe","forfiles.exe","nltest.exe"}
 WMI_POLL_INTERVAL  = 30
 TASK_POLL_INTERVAL = 60
 
@@ -101,6 +101,7 @@ PSPAWN_SUSPICIOUS_PARENTS = {
     "wmiprvse.exe", "rundll32.exe", "regsvr32.exe", "acrord32.exe",
     "foxitreader.exe", "javaw.exe",
     "node.exe", "hh.exe", "certutil.exe",
+    "python.exe", "pythonw.exe",
 }
 
 def _extension_dirs():
@@ -120,7 +121,7 @@ def _extension_dirs():
 EXTENSION_DIRS = _extension_dirs()
 
 DROP_EXTS = {".exe", ".dll", ".bat", ".vbs", ".ps1", ".js", ".jse",
-             ".scr", ".com", ".cmd"}
+             ".scr", ".com", ".cmd", ".iso"}
 DROP_WATCH_DIRS = []
 for d in list(TEMP_WATCH_DIRS) + [
     os.environ.get("APPDATA", ""), os.environ.get("LOCALAPPDATA", "")]:
@@ -503,8 +504,83 @@ def task_monitor():
             resolve_alert("Scheduled Task", f"New scheduled task: '{task}'")
         known = current
 
+# ---- Amber Albatross / PyInstaller stealer detection -----------------------
+# PyArmor-obfuscated PyInstaller payloads ship as a Python interpreter
+# (python.exe / pythonw.exe / pythonservice.exe) launched from a
+# user-writable path (AppData, Temp, Downloads) or by a PUP installer
+# (PC App Store, Bit Guardian, fake PDF utilities).
+PYTHON_EXE_NAMES = ("python.exe", "pythonw.exe", "python3.exe", "python38.exe",
+                   "python39.exe", "python310.exe", "python311.exe",
+                   "python312.exe", "python313.exe", "python314.exe",
+                   "pythonservice.exe", "pypy.exe", "pypy3.exe")
+
+def _python_good_roots():
+    roots = [r"C:\Python", r"C:\Program Files\Python",
+             r"C:\Program Files (x86)\Python"]
+    la = os.environ.get("LOCALAPPDATA", "")
+    if la:
+        roots.append(os.path.join(la, "Programs", "Python"))
+    up = os.environ.get("USERPROFILE", "")
+    if up:
+        roots.append(os.path.join(up, "AppData", "Local", "Microsoft", "WindowsApps"))
+    return [r.rstrip("\\").lower() for r in roots]
+
+PYTHON_GOOD_ROOTS = _python_good_roots()
+
+def _user_writable_dirs():
+    dirs = []
+    for v in ("APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "USERPROFILE"):
+        d = os.environ.get(v, "")
+        if d:
+            dirs.append(d.rstrip("\\").lower())
+            if v == "USERPROFILE":
+                dirs.append(os.path.join(d, "Downloads").lower())
+    return dirs
+
+def _is_exe_from_user_writable(exe_path):
+    if not exe_path:
+        return False
+    pl = exe_path.lower()
+    for d in _user_writable_dirs():
+        if pl.startswith(d):
+            return True
+    return False
+
+_PUP_MARKERS = ("setup.exe", "install.exe", "uninst.exe", "nsis", "innoextract",
+                "spoon", "pc app store", "bit guardian", "pdf", "launcher",
+                "getsoftware", "update.exe")
+
+def _is_suspicious_python(pname, pexe):
+    if pname not in PYTHON_EXE_NAMES:
+        return False
+    if not pexe:
+        return True
+    pl = pexe.lower()
+    for r in PYTHON_GOOD_ROOTS:
+        if pl.startswith(r):
+            return False
+    for d in _user_writable_dirs():
+        if pl.startswith(d):
+            return True
+    return False
+
+def _python_alert_level(parent_name, pexe):
+    pn = (parent_name or "").lower()
+    if any(m in pn for m in _PUP_MARKERS):
+        return "CRITICAL", (
+            f"Python interpreter launched by likely PUP/installer '{pn}'. "
+            "PyInstaller/PyArmor stealer payloads (e.g. Amber Albatross) "
+            "are delivered this way via PUAs like PC App Store / Bit Guardian.")
+    return "HIGH", (
+        "Unexpected Python interpreter running from a user-writable path "
+        f"({pexe}). PyInstaller/PyArmor stealer payloads commonly appear "
+        "as python.exe under AppData/Temp.")
+
 def process_monitor():
     seen = set()
+    seen_py = set()
+    py_alert_msgs = {}
+    pattern_alerts = {}
     while True:
         if MONITOR_ENABLED["process"]:
             try:
@@ -512,26 +588,156 @@ def process_monitor():
                 for proc in psutil.process_iter(['pid','name','exe']):
                     try:
                         pname = (proc.info['name'] or "").lower()
-                        if pname not in SUSPICIOUS_OUTBOUND_PROCESSES: continue
+                        # self-exclusion: skip our own process / exe
+                        if proc.pid == os.getpid():
+                            continue
+                        pexe = proc.info.get('exe') or ""
                         try:
-                            conns = proc.net_connections(kind='inet')
+                            if pexe and os.path.normcase(pexe) == os.path.normcase(sys.executable):
+                                continue
                         except Exception:
-                            conns = []
-                        for conn in conns:
-                            if conn.status == 'ESTABLISHED' and conn.raddr:
-                                key = (proc.pid, conn.raddr.ip, conn.raddr.port)
-                                active_now.add(key)
-                                if key not in seen:
-                                    seen.add(key)
-                                    raise_alert("HIGH","Suspicious Network",
-                                        f"{proc.info['name']} (PID {proc.pid}) → {conn.raddr.ip}:{conn.raddr.port}",
-                                        "Suspicious process making outbound connection.",
-                                        exe_path=proc.info.get('exe'))
+                            pass
+                        # get parent name for parent-based heuristics
+                        try:
+                            parent = proc.parent()
+                            ppname = parent.name().lower() if parent else ""
+                        except Exception:
+                            ppname = ""
+                        # get cmdline for cmdline-based heuristics
+                        try:
+                            cmdline_list = proc.cmdline()
+                            cmdline_str = " ".join(cmdline_list).lower()
+                        except Exception:
+                            cmdline_list = []
+                            cmdline_str = ""
+                        # (1) outbound network from known script/LOLbin hosts
+                        if pname in SUSPICIOUS_OUTBOUND_PROCESSES:
+                            try:
+                                conns = proc.net_connections(kind='inet')
+                            except Exception:
+                                conns = []
+                            for conn in conns:
+                                if conn.status == 'ESTABLISHED' and conn.raddr:
+                                    key = (proc.pid, conn.raddr.ip, conn.raddr.port)
+                                    active_now.add(key)
+                                    if key not in seen:
+                                        seen.add(key)
+                                        raise_alert("HIGH","Suspicious Network",
+                                            f"{proc.info['name']} (PID {proc.pid}) → {conn.raddr.ip}:{conn.raddr.port}",
+                                            "Suspicious process making outbound connection.",
+                                            exe_path=pexe)
+                        # (2) Amber Albatross / PyInstaller-style Python payloads
+                        if _is_suspicious_python(pname, pexe):
+                            pn = ppname
+                            level, reason = _python_alert_level(pn, pexe)
+                            key = (proc.pid, pexe.lower())
+                            if key not in seen_py:
+                                seen_py.add(key)
+                                py_alert_msgs[key] = (pname, pexe)
+                                raise_alert(level, "Suspicious Processes",
+                                    f"Python interpreter '{pname}' running from {pexe}",
+                                    reason, exe_path=pexe)
+                        # (3) cmdline and path-based threat heuristics
+                        pk = (proc.pid, "msiexec_remote")
+                        if pname == "msiexec.exe" and pk not in pattern_alerts:
+                            for part in cmdline_list:
+                                pl = part.lower()
+                                if pl.startswith(("http://", "https://")):
+                                    pattern_alerts[pk] = f"msiexec.exe downloading remote MSI: {part[:60]}"
+                                    raise_alert("HIGH", "Suspicious Processes",
+                                        pattern_alerts[pk],
+                                        "Remote MSI execution is used by Scarlet Goldfinch, Raspberry Robin.",
+                                        exe_path=pexe)
+                                    break
+                        pk = (proc.pid, "curl_script")
+                        if pname in ("curl.exe","curl") and pk not in pattern_alerts:
+                            for part in cmdline_list:
+                                pl = part.lower()
+                                if any(pl.endswith(ext) for ext in (".bat",".ps1",".vbs",".cmd",".jse",".js")):
+                                    pattern_alerts[pk] = f"curl.exe downloading script: {part[:60]}"
+                                    raise_alert("HIGH", "Suspicious Processes",
+                                        pattern_alerts[pk],
+                                        "curl downloading scripts is a common MintsLoader download cradle.",
+                                        exe_path=pexe)
+                                    break
+                        pk = (proc.pid, "nltest_recon")
+                        if pname == "nltest.exe" and pk not in pattern_alerts and "/domain_trusts" in cmdline_str:
+                            pattern_alerts[pk] = "nltest.exe domain trust reconnaissance"
+                            raise_alert("HIGH", "Suspicious Processes",
+                                pattern_alerts[pk],
+                                "nltest /domain_trusts is a SocGholish ransomware precursor for lateral movement.",
+                                exe_path=pexe)
+                        pk = (proc.pid, "schtasks_rundll32")
+                        if pname == "schtasks.exe" and pk not in pattern_alerts and "/create" in cmdline_str and "rundll32" in cmdline_str:
+                            pattern_alerts[pk] = f"schtasks.exe creating scheduled task with rundll32: {cmdline_str[:80]}"
+                            raise_alert("CRITICAL", "Suspicious Processes",
+                                pattern_alerts[pk],
+                                "schtasks /create with rundll32 is the exact CleanUpLoader persistence signature.",
+                                exe_path=pexe)
+                        pk = (proc.pid, "client32_padata")
+                        if pname == "client32.exe" and pk not in pattern_alerts and pexe and "programdata" in pexe.lower():
+                            pattern_alerts[pk] = f"NetSupport Manager client32.exe running from {pexe}"
+                            raise_alert("CRITICAL", "Suspicious Processes",
+                                pattern_alerts[pk],
+                                "client32.exe from non-ProgramFiles indicates NetSupport Manager abused as RAT.",
+                                exe_path=pexe)
+                        pk = (proc.pid, "printui_abnormal")
+                        if pname == "printui.exe" and pk not in pattern_alerts and pexe:
+                            sys32 = os.path.normcase(r"C:\Windows\System32")
+                            if not os.path.normcase(pexe).startswith(sys32):
+                                pattern_alerts[pk] = f"printui.exe running from non-standard path: {pexe}"
+                                raise_alert("HIGH", "Suspicious Processes",
+                                    pattern_alerts[pk],
+                                    "printui.exe outside System32 may indicate Tangerine Turkey malware.",
+                                    exe_path=pexe)
+                        pk = (proc.pid, "rundll32_userdll")
+                        if pname == "rundll32.exe" and pk not in pattern_alerts:
+                            for part in cmdline_list:
+                                if part.lower().endswith(".dll") and _is_exe_from_user_writable(part):
+                                    pattern_alerts[pk] = f"rundll32.exe loading DLL from user-writable path: {part[:60]}"
+                                    raise_alert("HIGH", "Suspicious Processes",
+                                        pattern_alerts[pk],
+                                        "rundll32 loading a DLL from AppData/Temp indicates CleanUpLoader DLL sideloading.",
+                                        exe_path=pexe)
+                                    break
+                        pk = (proc.pid, "node_userwritable")
+                        if pname == "node.exe" and pk not in pattern_alerts and _is_exe_from_user_writable(pexe):
+                            pattern_alerts[pk] = f"Node.js interpreter running from user-writable path: {pexe}"
+                            raise_alert("HIGH", "Suspicious Processes",
+                                pattern_alerts[pk],
+                                "node.exe from AppData/Temp may indicate Tampered Chef or Mocha Manakin stealer.",
+                                exe_path=pexe)
+                        pk = (proc.pid, "explorer_cmd_pasterun")
+                        if pname == "cmd.exe" and pk not in pattern_alerts and ppname == "explorer.exe" and "start" in cmdline_str and "exit" in cmdline_str:
+                            pattern_alerts[pk] = "cmd.exe spawned by explorer.exe with paste-and-run pattern"
+                            raise_alert("HIGH", "Suspicious Processes",
+                                pattern_alerts[pk],
+                                "explorer.exe → cmd.exe with 'start' + 'exit' is the exact KongTuke paste-and-run analytic.",
+                                exe_path=pexe)
                     except (psutil.NoSuchProcess, psutil.AccessDenied): pass
                 for key in seen - active_now:
                     pid, ip, port = key
                     resolve_alert("Suspicious Network", f"PID {pid} → {ip}:{port}")
                 seen = active_now
+                alive = {p.pid for p in psutil.process_iter(['pid'])}
+                old_seen_py = set(seen_py)
+                seen_py = {k for k in seen_py if k[0] in alive}
+                gone_py = old_seen_py - seen_py
+                for key in gone_py:
+                    pname, pexe = py_alert_msgs.pop(key, (None, None))
+                    if pname and pexe:
+                        msg = f"Python interpreter '{pname}' running from {pexe}"
+                        try:
+                            resolve_alert("Suspicious Processes", msg)
+                        except Exception:
+                            pass
+                for pk in list(pattern_alerts):
+                    if pk[0] not in alive:
+                        msg = pattern_alerts.pop(pk)
+                        try:
+                            resolve_alert("Suspicious Processes", msg)
+                        except Exception:
+                            pass
             except Exception: pass
         time.sleep(5)
 
@@ -910,7 +1116,7 @@ def dns_monitor():
             resolve_alert("DNS Anomaly", DNS_MSG)
 
 def powershell_spawn_monitor():
-
+    MONITORED_CHILDREN = {"powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe"}
     seen = set()
     while True:
         time.sleep(5)
@@ -920,7 +1126,8 @@ def powershell_spawn_monitor():
         try:
             for proc in psutil.process_iter(['pid', 'name']):
                 try:
-                    if (proc.info['name'] or "").lower() not in ("powershell.exe", "pwsh.exe"):
+                    child_name = (proc.info['name'] or "").lower()
+                    if child_name not in MONITORED_CHILDREN:
                         continue
                     ppid = proc.ppid()
                     if ppid == os.getpid():
@@ -928,13 +1135,12 @@ def powershell_spawn_monitor():
                     parent = psutil.Process(ppid) if ppid else None
                     pname = (parent.name().lower() if parent else "")
                     try:
-                        if (parent
-                                and os.path.basename(parent.exe() or "").lower()
-                                == os.path.basename(sys.executable).lower()):
+                        if parent and (parent.exe() or "") and \
+                                os.path.normcase(parent.exe()) == os.path.normcase(sys.executable):
                             continue
                     except Exception:
                         pass
-                    if pname in PSPAWN_SUSPICIOUS_PARENTS:
+                    if child_name in ("powershell.exe", "pwsh.exe") and pname in PSPAWN_SUSPICIOUS_PARENTS:
                         key = (proc.pid, pname)
                         if key in seen:
                             continue
@@ -943,6 +1149,14 @@ def powershell_spawn_monitor():
                                     f"PowerShell (PID {proc.pid}) spawned by {pname}",
                                     "Office/browser/mshta spawning PowerShell is a classic "
                                     "fake-CAPTCHA / macro delivery chain.")
+                    elif child_name in ("wscript.exe", "cscript.exe", "mshta.exe") and pname in TRUSTED_BROWSER_EXES:
+                        key = (proc.pid, pname)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        raise_alert("HIGH", "PowerShell Spawn",
+                                    f"{child_name} (PID {proc.pid}) spawned by browser {pname}",
+                                    "Browser spawning wscript/cscript/mshta is the classic SocGholish fake update chain.")
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
                     pass
         except Exception:
@@ -1056,10 +1270,27 @@ class DropHandler(FileSystemEventHandler):
                     or "default-release" in low or "defaultagent" in low):
                 return
             folder = os.path.basename(os.path.dirname(p))
+            drop_dir = str(p.parent)
             raise_alert("HIGH", "Executable Drop",
                         f"New {p.suffix.lower()} in {folder}: {p.name}",
                         "Unexpected executable/script dropped into a temp/user "
-                        "directory by a non-installer process.")
+                        "directory by a non-installer process.",
+                        extra={"drop_dir": drop_dir})
+        except Exception:
+            pass
+
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+        if not MONITOR_ENABLED["drop"]:
+            return
+        try:
+            p = Path(event.src_path)
+            if p.suffix.lower() not in DROP_EXTS:
+                return
+            folder = os.path.basename(os.path.dirname(p))
+            resolve_alert("Executable Drop",
+                          f"New {p.suffix.lower()} in {folder}: {p.name}")
         except Exception:
             pass
 
@@ -1505,8 +1736,13 @@ class AlertTable:
         m = tk.Label(frame, text=entry["message"], bg=ROW_BG, fg=TEXT, font=("Segoe UI",8), anchor="w")
         row["cells"]["message"] = m; row["bgw"].append(m)
         def _on_row_double(e, r=row):
+            cat = r["entry"].get("category", "")
             rp = r["entry"].get("reg_path")
-            if rp: self.app._open_regedit(rp)
+            dd = r["entry"].get("drop_dir")
+            if rp:
+                self.app._open_regedit(rp)
+            elif dd:
+                self.app._open_folder(dd)
         frame.bind("<Double-1>", _on_row_double)
         m.bind("<Double-1>", _on_row_double)
         def _on_enter(e, r=row): self._show_tip(r, e)
@@ -1766,6 +2002,17 @@ class DetectorApp(tk.Tk):
             if r <= 32:
 
                 subprocess.Popen(["regedit.exe"], creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            pass
+
+    def _open_folder(self, folder_path):
+        try:
+            shell32 = ctypes.windll.shell32
+            shell32.ShellExecuteW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                             ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                             ctypes.c_wchar_p, ctypes.c_int]
+            shell32.ShellExecuteW.restype = ctypes.c_int
+            shell32.ShellExecuteW(0, "open", folder_path, None, None, 1)
         except Exception:
             pass
 
