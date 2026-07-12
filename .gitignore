@@ -1,23 +1,23 @@
-# ── Secrets / local config (contains VirusTotal API key) ──
+# local storage
 config.json
 
-# ── Generated machine-specific state ──
+# machine-specific 
 baseline.json
 
-# ── Runtime output (may contain system paths / alert data) ──
+# output
 exports/
 
-# ── PyInstaller build artifacts ──
+# pyinstaller
 build/
 dist/
 __pycache__/
 *.pyc
 *.spec
 
-# ── Local editor / tooling settings ──
+# slop
 .vscode/
 .qodo/
 
-# ── Experimental / duplicate attempts (kept on disk, not tracked) ──
+# experimental
 /C\#/
 /python-depreciated/
