@@ -1,0 +1,19 @@
+# ── Secrets / local config (contains VirusTotal API key) ──
+config.json
+
+# ── Generated machine-specific state ──
+baseline.json
+
+# ── Runtime output (may contain system paths / alert data) ──
+exports/
+
+# ── PyInstaller build artifacts ──
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+
+# ── Local editor / tooling settings ──
+.vscode/
+.qodo/
