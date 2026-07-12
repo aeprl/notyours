@@ -90,7 +90,7 @@ TEMP_WATCH_DIRS = [d for d in [
 
 REG_POLL_INTERVAL    = 30
 DEFENDER_POLL_INTERVAL = 30
-DNS_POLL_INTERVAL    = 30
+DNS_POLL_INTERVAL    = 120
 DNS_SPIKE_MIN    = 15
 DNS_SPIKE_FACTOR = 2.5
 
@@ -605,6 +605,28 @@ def _python_alert_level(parent_name, pexe):
         "Unexpected Python interpreter running from a user-writable path "
         f"({pexe}). PyInstaller/PyArmor stealer payloads commonly appear "
         "as python.exe under AppData/Temp.")
+
+def self_defense():
+    exe = sys.executable
+    backup = exe + ".bak"
+    if getattr(sys, "frozen", False):
+        try:
+            if not os.path.exists(backup):
+                shutil.copy2(exe, backup)
+        except Exception:
+            pass
+    while True:
+        time.sleep(15)
+        if not os.path.exists(exe):
+            raise_alert("CRITICAL", "AV Kill Attempt",
+                        f"notyours executable deleted: {exe}",
+                        "Malware may have deleted notyours to evade detection.")
+            try:
+                if os.path.exists(backup):
+                    subprocess.Popen([backup], creationflags=CREATE_NO_WINDOW)
+            except Exception:
+                pass
+            break
 
 def process_monitor():
     seen = set()
@@ -1292,6 +1314,11 @@ class DropHandler(FileSystemEventHandler):
             if (os.path.basename(low) in ("prefs-1.js", "prefs.js")
                     or "\\mozilla\\" in low or "firefox" in low
                     or "default-release" in low or "defaultagent" in low):
+                return
+            if verify_signature(event.src_path) == "Valid":
+                return
+            downloads = os.path.join(os.environ.get("USERPROFILE", ""), "Downloads").lower()
+            if downloads and str(p.parent).lower().startswith(downloads):
                 return
             folder = os.path.basename(os.path.dirname(p))
             drop_dir = str(p.parent)
@@ -2416,6 +2443,7 @@ class DetectorApp(tk.Tk):
     def start_monitors(self):
         self.observers = start_file_watchers()
         threading.Thread(target=_open_files_checker, daemon=True).start()
+        threading.Thread(target=self_defense, daemon=True).start()
         for fn in [wmi_monitor, task_monitor, process_monitor,
                    registry_run_monitor, defender_exclusion_monitor, dns_monitor,
                    powershell_spawn_monitor, integrity_monitor,
