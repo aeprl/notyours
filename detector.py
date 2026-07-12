@@ -1699,7 +1699,7 @@ class DetectorApp(tk.Tk):
                 pystray.MenuItem("Exit", lambda: self.after(0, self._quit)),
             )
             self.tray_icon = pystray.Icon(
-                "notyours", img, "notyours — Session Stealer Detector", menu
+                "notyours", img, "notyours", menu
             )
             self.tray_icon.on_click = lambda icon, event: self.after(0, self._restore)
             self.tray_icon._balloon_callback = lambda: self.after(0, self._restore)
