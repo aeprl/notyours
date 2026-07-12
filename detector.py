@@ -1236,8 +1236,8 @@ def _resolve_logo_path():
         _meipass = getattr(sys, "_MEIPASS", None)
         for base in (_meipass, _exe_dir, os.path.join(_exe_dir, "_internal")):
             if base:
-                candidates.append(os.path.join(base, "notyours2.png"))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "notyours2.png"))
+                candidates.append(os.path.join(base, "notyours.ico"))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "notyours.ico"))
     for p in candidates:
         if p and os.path.exists(p):
             return p

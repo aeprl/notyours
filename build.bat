@@ -10,15 +10,15 @@ if not exist "%SRC%" (
     exit /b 1
 )
 
-if not exist "notyours2.png" (
-    echo WARNING: notyours2.png not found; the tray/title-bar logo will be skipped.
+if not exist "notyours.ico" (
+    echo WARNING: notyours.ico not found; the tray/title-bar logo will be skipped.
 )
 
 if not exist "notyours.ico" (
     echo WARNING: notyours.ico not found; the exe will use PyInstaller's default icon.
 )
 
-python -m PyInstaller -y --noconsole --onedir --clean --name notyours --icon "notyours.ico" --add-data "notyours2.png;." --hidden-import pystray._win32 --hidden-import pystray._util --hidden-import pystray._util.win32 %SRC%
+python -m PyInstaller -y --noconsole --onedir --clean --name notyours --icon "notyours.ico" --add-data "notyours.ico;." --hidden-import pystray._win32 --hidden-import pystray._util --hidden-import pystray._util.win32 %SRC%
 
 echo.
 if exist "dist\notyours\notyours.exe" (
