@@ -25,6 +25,15 @@ from watchdog.events import FileSystemEventHandler
 import pystray
 from PIL import Image
 
+try:
+    import win32serviceutil
+    import win32service
+    import win32event
+    import servicemanager
+    HAS_SERVICE = True
+except ImportError:
+    HAS_SERVICE = False
+
 _NIN_BALLOONUSERCLICK = 0x0405
 try:
     _orig_on_notify = pystray._win32.Icon._on_notify
@@ -178,6 +187,45 @@ AV_TOOLS = {"avastui.exe","avastsvc.exe","afwserv.exe","wireshark.exe",
             "securityhealthsystray.exe"}
 AV_POLL = 10
 
+RISK_WEIGHTS = {
+    "file_drop_appdata":     10,
+    "unsigned_binary":       30,
+    "suspicious_parent":     25,
+    "registry_persistence":  20,
+    "browser_file_access":   15,
+    "outbound_connection":   35,
+    "clipboard_crypto":      20,
+    "wmi_subscription":      25,
+    "defender_exclusion":    30,
+    "process_from_temp":     20,
+    "dns_anomaly":           15,
+    "powershell_spawn":      25,
+    "screenshot_capture":    10,
+    "typelib_hijack":        20,
+    "wallet_access":         25,
+    "extension_added":       15,
+    "archive_staging":       10,
+    "integrity_violation":   30,
+    "self_defense_trigger":  50,
+    "exe_drop":              10,
+    "unsigned_drop":         25,
+    "registry_run_key":      20,
+}
+ALERT_THRESHOLD = 60
+SCORE_DECAY_SECONDS = 300
+
+TRUSTED_PARENTS = {
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "explorer.exe", "svchost.exe", "services.exe", "winlogon.exe",
+    "lsass.exe", "csrss.exe", "smss.exe", "system", "system idle process",
+    "sihost.exe", "taskhostw.exe", "runtimebroker.exe",
+    "shellexperiencehost.exe", "applicationframehost.exe",
+    "windowsinternal.composableshell.experiences.textinput.inputapp.exe",
+    "searchapp.exe", "searchui.exe", "startmenuexperiencehost.exe",
+    "dllhost.exe", "rundll32.exe",
+    "unsecapp.exe", "mmc.exe", "wmic.exe",
+}
+
 WHITELIST_BUILTIN_TASKS = True
 
 MONITOR_ENABLED = {"browser": True, "wmi": True, "tasks": True,
@@ -264,6 +312,231 @@ def is_builtin_task(name):
                "onedrive","microsoft-windows","windows defender",".net framework",
                "adobe","nvidia","intel","amd","realtek"
            ])
+
+
+class ScoreTracker:
+    """Accumulates risk scores per entity with time-based decay."""
+    def __init__(self, decay=300):
+        self._lock = threading.Lock()
+        self._scores = {}
+        self._decay = decay
+
+    def add(self, key, indicator, points, metadata=None):
+        with self._lock:
+            now = time.time()
+            self._prune(now)
+            entry = self._scores.get(key)
+            if entry is None:
+                entry = {"score": 0, "indicators": {}, "updated": now, "metadata": {}}
+                self._scores[key] = entry
+            if indicator not in entry["indicators"]:
+                entry["indicators"][indicator] = now
+                entry["score"] += points
+                entry["updated"] = now
+                if metadata:
+                    entry["metadata"].update(metadata)
+            return entry["score"]
+
+    def _prune(self, now):
+        expired = [k for k, v in self._scores.items()
+                   if now - v.get("updated", 0) > self._decay]
+        for k in expired:
+            del self._scores[k]
+
+    def get(self, key):
+        with self._lock:
+            entry = self._scores.get(key)
+            return entry["score"] if entry else 0
+
+    def clear(self, key):
+        with self._lock:
+            self._scores.pop(key, None)
+
+    def snapshot(self, key):
+        with self._lock:
+            entry = self._scores.get(key)
+            if entry:
+                return dict(entry["metadata"]), list(entry["indicators"].keys())
+            return {}, []
+
+score_tracker = ScoreTracker(decay=SCORE_DECAY_SECONDS)
+_responded_pids = set()
+_response_lock = threading.Lock()
+
+
+_kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+_ntdll = ctypes.WinDLL('ntdll', use_last_error=True)
+
+_OpenProcess = _kernel32.OpenProcess
+_OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_OpenProcess.restype = wintypes.HANDLE
+_CloseHandle = _kernel32.CloseHandle
+_CloseHandle.argtypes = [wintypes.HANDLE]
+_CloseHandle.restype = wintypes.BOOL
+_TerminateProcess = _kernel32.TerminateProcess
+_TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+_TerminateProcess.restype = wintypes.BOOL
+_NtSuspendProcess = _ntdll.NtSuspendProcess
+_NtSuspendProcess.argtypes = [wintypes.HANDLE]
+_NtSuspendProcess.restype = wintypes.LONG
+_NtResumeProcess = _ntdll.NtResumeProcess
+_NtResumeProcess.argtypes = [wintypes.HANDLE]
+_NtResumeProcess.restype = wintypes.LONG
+
+PROCESS_SUSPEND_RESUME = 0x0800
+PROCESS_TERMINATE = 0x0001
+PROCESS_QUERY_INFORMATION = 0x0400
+
+def _get_pid_from_path(exe_path):
+    if not exe_path:
+        return None
+    target = os.path.normpath(exe_path).lower()
+    try:
+        for proc in psutil.process_iter(["pid", "exe"]):
+            try:
+                if proc.exe() and os.path.normpath(proc.exe()).lower() == target:
+                    return proc.pid
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass
+    return None
+
+def suspend_process(pid):
+    h = _OpenProcess(PROCESS_SUSPEND_RESUME | PROCESS_QUERY_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        return _NtSuspendProcess(h) >= 0
+    finally:
+        _CloseHandle(h)
+
+def resume_process(pid):
+    h = _OpenProcess(PROCESS_SUSPEND_RESUME | PROCESS_QUERY_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        return _NtResumeProcess(h) >= 0
+    finally:
+        _CloseHandle(h)
+
+def kill_process(pid):
+    h = _OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        return _TerminateProcess(h, 1)
+    finally:
+        _CloseHandle(h)
+
+def block_ip_firewall(ip, rule_name=None):
+    if not rule_name:
+        rule_name = f"NotYours Block {ip}"
+    try:
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}", "dir=out", "action=block",
+             f"remoteip={ip}", "enable=yes"],
+            capture_output=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        return True
+    except Exception:
+        return False
+
+def _active_response(total, indicator, exe_path, extra):
+    if not exe_path:
+        return
+    pid = _get_pid_from_path(exe_path)
+    if pid is None:
+        return
+    mypid = os.getpid()
+    if pid == mypid:
+        return
+    with _response_lock:
+        if pid in _responded_pids:
+            return
+    actions = []
+    if total >= 100:
+        if kill_process(pid):
+            actions.append("killed")
+            with _response_lock:
+                _responded_pids.add(pid)
+    elif total >= 80:
+        if suspend_process(pid):
+            actions.append("suspended")
+            with _response_lock:
+                _responded_pids.add(pid)
+    if indicator == "outbound_connection" and total >= 80 and extra:
+        ip = extra.get("ip", "")
+        if ip and block_ip_firewall(ip):
+            actions.append(f"blocked_ip:{ip}")
+    if actions:
+        try:
+            raise_alert("ACTION", "Active Response",
+                        f"Auto-response: {', '.join(actions)} on PID {pid}",
+                        f"Path: {exe_path}\nScore: {total}\nIndicator: {indicator}",
+                        exe_path)
+        except Exception:
+            pass
+
+def process_lineage_check(exe_path):
+    """Return risk-score adjustment based on parent process chain.
+    Positive = more suspicious, Negative = less suspicious."""
+    if not exe_path:
+        return 0
+    target = os.path.normpath(exe_path).lower()
+    try:
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                if proc.exe() and os.path.normpath(proc.exe()).lower() == target:
+                    parent = proc.parent()
+                    if parent is None:
+                        return 0
+                    pname = parent.name().lower()
+                    pexe = parent.exe().lower() if parent.exe() else ""
+                    if pname in TRUSTED_PARENTS:
+                        return -20
+                    if pname in PSPAWN_SUSPICIOUS_PARENTS:
+                        return 25
+                    if pexe and not verify_signature(pexe):
+                        return 15
+                    return 5
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return 0
+
+def score_event(indicator, category, message, exe_path=None, detail="", extra=None):
+    """Accumulate a risk indicator and alert only if score >= threshold."""
+    weight = RISK_WEIGHTS.get(indicator, 10)
+    lineage = 0
+    if exe_path:
+        lineage = process_lineage_check(exe_path)
+    net = weight + max(lineage, -weight)
+    entity_key = exe_path or _make_key(category, message)
+    meta = {"category": category, "message": message, "detail": detail, "exe_path": exe_path, "extra": extra}
+    total = score_tracker.add(entity_key, indicator, net, meta)
+    _active_response(total, indicator, exe_path, extra)
+    if total >= ALERT_THRESHOLD:
+        if total >= 100:
+            level = "CRITICAL"
+        elif total >= 60:
+            level = "HIGH"
+        else:
+            level = "MEDIUM"
+        md, inds = score_tracker.snapshot(entity_key)
+        ind_lines = "\n".join(f"  +{RISK_WEIGHTS.get(i,10)} [{i}]" for i in inds)
+        merged = detail
+        if ind_lines:
+            merged += "\n\nScore Breakdown:\n" + ind_lines
+        if extra is None:
+            extra = {"score_total": total, "indicators": inds, "lineage_score": lineage}
+        else:
+            extra.update({"score_total": total, "indicators": inds, "lineage_score": lineage})
+        raise_alert(level, category, message, merged, exe_path, extra=extra)
+        score_tracker.clear(entity_key)
 
 alert_lock    = threading.Lock()
 active_alerts = {}
@@ -628,6 +901,112 @@ def self_defense():
                 pass
             break
 
+def _check_wmi_new_process(p):
+    """Handle a WMI Win32_Process creation event."""
+    try:
+        pid = p.ProcessId
+        name = p.Name
+        exe_path = p.ExecutablePath
+        cmdline = p.CommandLine or ""
+        ppid = p.ParentProcessId
+        if not name or not exe_path:
+            return
+        nl = name.lower()
+        el = exe_path.lower()
+        if nl in ("powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe"):
+            try:
+                parent = psutil.Process(ppid) if ppid else None
+                if parent and parent.name().lower() in PSPAWN_SUSPICIOUS_PARENTS:
+                    score_event("powershell_spawn","PowerShell Spawn",
+                        f"{name} spawned by {parent.name()}",
+                        exe_path=exe_path,
+                        detail=f"Script host launched from suspicious parent: {parent.name()}")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if nl in ("python.exe","python3.exe","py.exe"):
+            if _is_suspicious_python(name, exe_path):
+                pn = ""
+                try:
+                    parent = psutil.Process(ppid) if ppid else None
+                    pn = parent.name() if parent else ""
+                except Exception:
+                    pass
+                level, reason = _python_alert_level(pn, exe_path)
+                score_event("process_from_temp","Suspicious Processes",
+                    f"Python '{name}' running from {exe_path}",
+                    exe_path=exe_path, detail=f"Reason: {reason}")
+        if nl == "msiexec.exe" and ("://" in cmdline or "\\\\" in cmdline):
+            score_event("outbound_connection","Suspicious Network",
+                f"msiexec remote MSI: {cmdline[:100]}",
+                exe_path=exe_path,
+                detail="msiexec.exe installing from remote URL — possible lateral movement.")
+        if nl == "curl.exe":
+            score_event("process_from_temp","Suspicious Network",
+                f"curl.exe: {cmdline[:100]}",
+                exe_path=exe_path,
+                detail="curl.exe running — possible script download.")
+        if nl == "nltest.exe":
+            score_event("dns_anomaly","Suspicious Network",
+                "nltest.exe running — domain reconnaissance",
+                exe_path=exe_path)
+        _check_wallet_on_process(nl, el, pid)
+    except Exception:
+        pass
+
+def _check_wmi_deleted_process(p):
+    """Handle a WMI Win32_Process deletion event — AV kill detection."""
+    try:
+        name = p.Name.lower() if p.Name else ""
+        if name in AV_TOOLS:
+            score_event("self_defense_trigger","AV Kill Attempt",
+                f"AV process terminated: {p.Name}",
+                detail="An antimalware or analysis tool process was stopped. "
+                       "This may indicate a kill-switch by infostealer malware.")
+    except Exception:
+        pass
+
+def _check_wallet_on_process(name_lower, exe_path, pid):
+    """Quick wallet check on process creation — no full file-scan."""
+    try:
+        if name_lower in ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe"):
+            return
+        if name_lower in WALLET_BENIGN:
+            return
+        if any(w in exe_path.lower() for w in ("metamask","nkbihfbeogaeaoehlefnkodbefgpgknn")):
+            score_event("wallet_access","Wallet Access",
+                f"Unknown process accessing wallet: {name_lower}",
+                exe_path=exe_path,
+                detail="A non-benign process has wallet-related content in its path.")
+    except Exception:
+        pass
+
+def start_wmi_process_monitor():
+    """Subscribe to WMI process creation/deletion events. Returns True on success."""
+    try:
+        import wmi
+        c = wmi.WMI()
+    except Exception:
+        return False
+    def _creation_loop():
+        try:
+            watcher = c.watch_for(notification_type="Creation",
+                                  wmi_class="Win32_Process", delay_secs=1)
+            while True:
+                _check_wmi_new_process(watcher())
+        except Exception:
+            pass
+    def _deletion_loop():
+        try:
+            watcher = c.watch_for(notification_type="Deletion",
+                                  wmi_class="Win32_Process", delay_secs=1)
+            while True:
+                _check_wmi_deleted_process(watcher())
+        except Exception:
+            pass
+    threading.Thread(target=_creation_loop, daemon=True).start()
+    threading.Thread(target=_deletion_loop, daemon=True).start()
+    return True
+
 def process_monitor():
     seen = set()
     seen_py = set()
@@ -674,6 +1053,9 @@ def process_monitor():
                                             f"{proc.info['name']} (PID {proc.pid}) → {conn.raddr.ip}:{conn.raddr.port}",
                                             "Suspicious process making outbound connection.",
                                             exe_path=pexe)
+                                    score_event("outbound_connection", "Suspicious Network",
+                                        f"{proc.info['name']} (PID {proc.pid}) → {conn.raddr.ip}:{conn.raddr.port}",
+                                        exe_path=pexe)
                         if _is_suspicious_python(pname, pexe):
                             pn = ppname
                             level, reason = _python_alert_level(pn, pexe)
@@ -800,9 +1182,9 @@ def clipboard_monitor(root):
                     is_crypto = any(current.startswith(p) and len(current)>25 for p in CRYPTO_PATTERNS)
                     if is_crypto and not flagged:
                         flagged = True
-                        raise_alert("MEDIUM","Clipboard",
+                        score_event("clipboard_crypto", "Clipboard",
                             "Possible crypto address in clipboard — verify it hasn't been swapped",
-                            f"Value starts with: {current[:20]}...")
+                            detail=f"Value starts with: {current[:20]}...")
                     elif not is_crypto and flagged:
                         flagged = False
                         resolve_alert("Clipboard","Possible crypto address in clipboard — verify it hasn't been swapped")
@@ -1322,11 +1704,18 @@ class DropHandler(FileSystemEventHandler):
                 return
             folder = os.path.basename(os.path.dirname(p))
             drop_dir = str(p.parent)
-            raise_alert("HIGH", "Executable Drop",
+            folder_lower = str(p.parent).lower()
+            is_appdata = "\\appdata\\" in folder_lower or "\\temp\\" in folder_lower
+            score_event("unsigned_drop", "Executable Drop",
                         f"New {p.suffix.lower()} in {folder}: {p.name}",
-                        "Unexpected executable/script dropped into a temp/user "
-                        "directory by a non-installer process.",
+                        exe_path=str(p),
+                        detail="Unexpected unsigned executable/script dropped into a temp/user "
+                               "directory by a non-installer process.",
                         extra={"drop_dir": drop_dir})
+            if is_appdata:
+                score_event("file_drop_appdata", "Executable Drop",
+                            f"AppData drop in {folder}: {p.name}",
+                            exe_path=str(p))
         except Exception:
             pass
 
@@ -1383,6 +1772,172 @@ def typelib_monitor():
         baseline = load_baseline() or {}
         baseline["typelib"] = list(known)
         save_baseline(baseline)
+
+
+def _wait_reg_change(hive, subkey, watch_subtree=True):
+    """Block until registry key changes (native RegNotifyChangeKeyValue via ctypes)."""
+    from ctypes import WinDLL, wintypes, get_last_error
+    _advapi32 = WinDLL('advapi32', use_last_error=True)
+    try:
+        key = winreg.OpenKey(hive, subkey, 0, winreg.KEY_NOTIFY)
+        _filter = winreg.REG_NOTIFY_CHANGE_NAME | winreg.REG_NOTIFY_CHANGE_LAST_SET
+        rc = _advapi32.RegNotifyChangeKeyValue(
+            int(key), watch_subtree, _filter, None, False
+        )
+        key.Close()
+        return rc == 0
+    except Exception:
+        return False
+
+
+def _run_key_check(known):
+    """Compare current run-key state to known, emit alerts for changes. Returns new known."""
+    current = get_reg_run_entries()
+    if not MONITOR_ENABLED["registry"]:
+        return current
+    for key, value in current.items():
+        if key not in known:
+            label, subkey, name = key
+            raise_reg_run(label, subkey, name, value)
+    for key in list(known):
+        if key not in current:
+            label, subkey, name = key
+            resolve_alert("Registry Run Key",
+                         f"Run-key entry '{name}' in {label}\\{subkey}")
+    return current
+
+
+def _watch_reg_key_loop(hive, subkey, label, check_fn, poll_ms=5000):
+    """Thread: wait for registry change on a single key, call check_fn when triggered."""
+    while True:
+        if not _wait_reg_change(hive, subkey):
+            time.sleep(poll_ms / 1000)
+            continue
+        check_fn()
+
+
+def _reg_run_watcher():
+    """Event-driven replacement for registry_run_monitor."""
+    known = get_reg_run_entries()
+    if MONITOR_ENABLED["registry"]:
+        for (label, subkey, name), value in known.items():
+            raise_reg_run(label, subkey, name, value)
+    for hive, label, sk in REG_RUN_KEYS:
+        def check(k=known):
+            nonlocal known
+            known = _run_key_check(known)
+        threading.Thread(target=_watch_reg_key_loop,
+                         args=(hive, sk, label, check), daemon=True).start()
+
+
+def _defender_excl_watcher():
+    """Event-driven replacement for defender_exclusion_monitor."""
+    known = get_defender_exclusions()
+    hive, label, sk = DEFENDER_EXCL_KEY
+    def check():
+        nonlocal known
+        if not MONITOR_ENABLED["defender"]:
+            known = get_defender_exclusions()
+            return
+        current = get_defender_exclusions()
+        for name, value in current.items():
+            if name not in known:
+                raise_alert("CRITICAL", "Defender Exclusion",
+                            f"New Defender exclusion path: {name}",
+                            f"Value: {value} (malware adds exclusions to evade scanning)")
+        for name in list(known):
+            if name not in current:
+                resolve_alert("Defender Exclusion",
+                             f"New Defender exclusion path: {name}")
+        known = current
+    threading.Thread(target=_watch_reg_key_loop,
+                     args=(hive, sk, label, check), daemon=True).start()
+
+
+def _integrity_watcher():
+    """Event-driven replacement for integrity_monitor."""
+    baseline = load_baseline()
+    if baseline is None:
+        save_baseline(_snapshot_integrity())
+        baseline = load_baseline() or {"run": {}, "startup": {}}
+    known_run = get_reg_run_entries()
+    known_tl = set(get_typelib_entries().keys())
+    def check_run():
+        nonlocal baseline, known_run
+        if not MONITOR_ENABLED["integrity"]:
+            baseline = _snapshot_integrity()
+            known_run = get_reg_run_entries()
+            return
+        current = _snapshot_integrity()
+        for rk, val in current["run"].items():
+            if rk in baseline["run"] and baseline["run"][rk] != val:
+                raise_alert("HIGH", "Run-Key Integrity",
+                            f"Run-key value changed: {rk}",
+                            f"Old: {baseline['run'][rk]}\nNew: {val}\n"
+                            "A stealer may have overwritten an existing entry to masquerade.")
+        for sf, h in current["startup"].items():
+            if sf in baseline["startup"] and baseline["startup"][sf] != h:
+                raise_alert("HIGH", "Startup Integrity",
+                            f"Startup item modified: {os.path.basename(sf)}",
+                            f"Hash changed (old {baseline['startup'][sf][:12]} \u2192 "
+                            f"new {h[:12]}) \u2014 possible tampering.")
+        baseline = current
+        save_baseline(baseline)
+        known_run = get_reg_run_entries()
+    def check_tl():
+        nonlocal baseline, known_tl
+        if not MONITOR_ENABLED["integrity"]:
+            known_tl = set(get_typelib_entries().keys())
+            return
+        current_set = set(get_typelib_entries().keys())
+        if current_set != known_tl:
+            baseline = _snapshot_integrity()
+            save_baseline(baseline)
+            known_tl = current_set
+    for hive, label, sk in REG_RUN_KEYS:
+        threading.Thread(target=_watch_reg_key_loop,
+                         args=(hive, sk, label, check_run), daemon=True).start()
+    hive_tl = TYPELIB_KEY[0]
+    sk_tl = TYPELIB_KEY[2]
+    threading.Thread(target=_watch_reg_key_loop,
+                     args=(hive_tl, sk_tl, "TYPELIB", check_tl), daemon=True).start()
+
+
+def _typelib_watcher():
+    """Event-driven replacement for typelib_monitor."""
+    baseline = load_baseline() or {}
+    tl_base = baseline.get("typelib")
+    if tl_base is None:
+        tl_base = list(get_typelib_entries().keys())
+        baseline["typelib"] = tl_base
+        save_baseline(baseline)
+    known = set(tl_base)
+    hive, label, sk = TYPELIB_KEY
+    def check():
+        nonlocal known
+        if not MONITOR_ENABLED["typelib"]:
+            known = set(get_typelib_entries().keys())
+            return
+        current = set(get_typelib_entries().keys())
+        for name in current - known:
+            raise_alert("HIGH", "TypeLib Hijack",
+                        f"New TypeLib entry: {name}",
+                        "HKCU\\Software\\Classes\\TypeLib modification is an "
+                        "emerging infostealer persistence / hijack technique.")
+        known = current
+        bl = load_baseline() or {}
+        bl["typelib"] = list(known)
+        save_baseline(bl)
+    threading.Thread(target=_watch_reg_key_loop,
+                     args=(hive, sk, label, check), daemon=True).start()
+
+
+def start_registry_monitors():
+    """Start event-driven registry watchers. Replaces 4 polling monitors."""
+    _reg_run_watcher()
+    _defender_excl_watcher()
+    _integrity_watcher()
+    _typelib_watcher()
 
 def wallet_monitor():
     seen_open = set()
@@ -2442,19 +2997,64 @@ class DetectorApp(tk.Tk):
 
     def start_monitors(self):
         self.observers = start_file_watchers()
+        start_wmi_process_monitor()
+        start_registry_monitors()
         threading.Thread(target=_open_files_checker, daemon=True).start()
         threading.Thread(target=self_defense, daemon=True).start()
-        for fn in [wmi_monitor, task_monitor, process_monitor,
-                   registry_run_monitor, defender_exclusion_monitor, dns_monitor,
-                   powershell_spawn_monitor, integrity_monitor,
-                   typelib_monitor, wallet_monitor, avkill_monitor]:
+        for fn in [wmi_monitor, task_monitor, dns_monitor]:
             threading.Thread(target=fn, daemon=True).start()
         threading.Thread(target=clipboard_monitor, args=(self,), daemon=True).start()
 
     def on_close(self):
         self._quit()
 
+
+_SERVICE_STOP = threading.Event()
+
+def run_headless():
+    """Start all monitors without Tkinter GUI. Blocks until stop signal."""
+    observers = start_file_watchers()
+    start_wmi_process_monitor()
+    start_registry_monitors()
+    threading.Thread(target=_open_files_checker, daemon=True).start()
+    threading.Thread(target=self_defense, daemon=True).start()
+    for fn in [wmi_monitor, task_monitor, dns_monitor]:
+        threading.Thread(target=fn, daemon=True).start()
+    threading.Thread(target=clipboard_monitor, args=(None,), daemon=True).start()
+    _SERVICE_STOP.wait()
+
+
+if HAS_SERVICE:
+    class NotYoursService(win32serviceutil.ServiceFramework):
+        _svc_name_ = "NotYoursEDR"
+        _svc_display_name_ = "NotYours EDR Service"
+        _svc_description_ = "Event-driven endpoint detection & response with risk scoring and active response."
+
+        def __init__(self, args):
+            win32serviceutil.ServiceFramework.__init__(self, args)
+            self._hWaitStop = win32event.CreateEvent(None, 0, 0, None)
+
+        def SvcStop(self):
+            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            win32event.SetEvent(self._hWaitStop)
+            _SERVICE_STOP.set()
+
+        def SvcDoRun(self):
+            servicemanager.LogMsg(
+                servicemanager.EVENTLOG_INFORMATION_TYPE,
+                servicemanager.PYS_SERVICE_STARTED,
+                (self._svc_name_, "")
+            )
+            try:
+                run_headless()
+            except Exception as exc:
+                servicemanager.LogErrorMsg(str(exc))
+                raise
+
 if __name__ == "__main__":
-    app = DetectorApp()
-    app.start_monitors()
-    app.mainloop()
+    if HAS_SERVICE and len(sys.argv) > 1 and sys.argv[1] in ("install", "start", "stop", "remove", "restart", "debug"):
+        win32serviceutil.HandleCommandLine(NotYoursService)
+    else:
+        app = DetectorApp()
+        app.start_monitors()
+        app.mainloop()
