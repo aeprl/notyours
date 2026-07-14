@@ -74,7 +74,7 @@ python detector.py cli          # commandline mode
 
 ## disclaimer
 
-- notyours does not actively delete ANY detection and is only used for alerts
+- notyours does not actively delete ANY detection (only suspends it) and is mainly used for alerts
 - no piece of information collected in notyours goes anywhere outside of your computer
 - the code is sloppy and heavily vibe coded as i made this quickly being the receiving end of a session hijacking attack
 
