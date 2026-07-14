@@ -1,6 +1,18 @@
 import os, sys, time, json, hashlib, datetime, threading, ctypes, subprocess
+import logging
+from logging.handlers import RotatingFileHandler
 from ctypes import wintypes
 import psutil
+
+_engine_dir = os.path.dirname(os.path.abspath(__file__))
+_error_log_path = os.path.join(_engine_dir, "notyours_error.log")
+_handler = RotatingFileHandler(_error_log_path, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.getLogger().addHandler(_handler)
+logging.getLogger().setLevel(logging.WARNING)
+
+def log_error(source, msg):
+    logging.getLogger(source).error(msg, exc_info=True)
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -16,6 +28,7 @@ RISK_WEIGHTS = {
     "archive_staging":       10,  "integrity_violation":   30,
     "self_defense_trigger":  50,  "exe_drop":              10,
     "unsigned_drop":         25,  "registry_run_key":      20,
+    "shadow_copy_deletion":  50,
 }
 ALERT_THRESHOLD = 0
 SCORE_DECAY_SECONDS = 300

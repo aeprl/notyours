@@ -25,3 +25,4 @@ __pycache__/
 test_detections.py
 notyours_dpg.py
 notyours.log
+notyours_error.log

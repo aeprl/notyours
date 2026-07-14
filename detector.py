@@ -999,6 +999,7 @@ class DetectorApp(tk.Tk):
         self.after(0, lambda: self._handle_alert(event_type, entry))
 
     def _handle_alert(self, event_type, entry):
+        _log_alert_entry(event_type, entry)
         level = entry["level"]
         if event_type == "new":
             self.alert_counts[level] = self.alert_counts.get(level, 0) + 1
@@ -1050,6 +1051,7 @@ class DetectorApp(tk.Tk):
             f"Saved to:\n{active_path}\n{past_path}")
 
     def start_monitors(self):
+        _log_session_start("GUI")
         self.observers = start_file_watchers()
         start_wmi_process_monitor()
         start_registry_monitors()
@@ -1101,7 +1103,7 @@ def _log_session_start(mode):
     except Exception:
         pass
 
-def _headless_callback(event_type, entry):
+def _log_alert_entry(event_type, entry):
     ts = entry["time"]
     line = f"[{ts}] [{_SESSION_ID}] [{entry['level']}] {entry['category']}: {entry['message']}"
     try:
@@ -1109,6 +1111,11 @@ def _headless_callback(event_type, entry):
             f.write(line + "\n")
     except Exception:
         pass
+
+def _headless_callback(event_type, entry):
+    _log_alert_entry(event_type, entry)
+    ts = entry["time"]
+    line = f"[{ts}] [{_SESSION_ID}] [{entry['level']}] {entry['category']}: {entry['message']}"
     try:
         print(line, flush=True)
     except Exception:

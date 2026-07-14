@@ -231,7 +231,8 @@ def _open_files_checker():
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
             except Exception:
-                pass
+                try: log_error("watchers", "_open_files_checker failed")
+                except Exception: pass
 
 class BrowserProfileHandler(FileSystemEventHandler):
     def __init__(self, browser_name):
@@ -512,9 +513,28 @@ def _check_wmi_new_process(p):
                         exe_path=exe_path,
                         detail="rundll32 loading a DLL from AppData/Temp indicates CleanUpLoader DLL sideloading.")
                     break
+        if nl in ("vssadmin.exe",):
+            if "delete shadows" in cmdline.lower():
+                score_event("shadow_copy_deletion","Ransomware",
+                    f"vssadmin.exe deleting shadow copies: {cmdline[:100]}",
+                    exe_path=exe_path,
+                    detail="Shadow copy deletion is a hallmark ransomware precursor.")
+        if nl in ("wmic.exe",):
+            cl = cmdline.lower()
+            if "shadowcopy" in cl and "delete" in cl:
+                score_event("shadow_copy_deletion","Ransomware",
+                    f"wmic.exe deleting shadow copies: {cmdline[:100]}",
+                    exe_path=exe_path,
+                    detail="WMIC shadow copy deletion is a hallmark ransomware precursor.")
+        if nl in ("diskshadow.exe",):
+            score_event("shadow_copy_deletion","Ransomware",
+                f"diskshadow.exe running: {cmdline[:100]}",
+                exe_path=exe_path,
+                detail="diskshadow execution may indicate ransomware (manipulates Volume Shadow Copies).")
         _check_wallet_on_process(nl, el, pid)
     except Exception:
-        pass
+        try: log_error("watchers", "WMI process callback failed")
+        except Exception: pass
 
 def _check_wmi_deleted_process(p):
     """Handle a WMI Win32_Process deletion event — AV kill detection."""
@@ -526,7 +546,8 @@ def _check_wmi_deleted_process(p):
                 detail="An antimalware or analysis tool process was stopped. "
                        "This may indicate a kill-switch by infostealer malware.")
     except Exception:
-        pass
+        try: log_error("watchers", "WMI deletion callback failed")
+        except Exception: pass
 
 def _check_wallet_on_process(name_lower, exe_path, pid):
     """Quick wallet check on process creation — no full file-scan."""
@@ -541,7 +562,8 @@ def _check_wallet_on_process(name_lower, exe_path, pid):
                 exe_path=exe_path,
                 detail="A non-benign process has wallet-related content in its path.")
     except Exception:
-        pass
+        try: log_error("watchers", "_check_wallet_on_process failed")
+        except Exception: pass
 
 def start_wmi_process_monitor():
     """Subscribe to WMI process creation/deletion events. Returns True on success."""
@@ -549,6 +571,8 @@ def start_wmi_process_monitor():
         import wmi
         c = wmi.WMI()
     except Exception:
+        try: log_error("watchers", "WMI import failed — WMI monitoring disabled")
+        except Exception: pass
         return False
     def _creation_loop():
         try:
@@ -557,7 +581,8 @@ def start_wmi_process_monitor():
             while True:
                 _check_wmi_new_process(watcher())
         except Exception:
-            pass
+            try: log_error("watchers", "WMI creation loop crashed — process creation monitoring stopped")
+            except Exception: pass
     def _deletion_loop():
         try:
             watcher = c.watch_for(notification_type="Deletion",
@@ -565,7 +590,8 @@ def start_wmi_process_monitor():
             while True:
                 _check_wmi_deleted_process(watcher())
         except Exception:
-            pass
+            try: log_error("watchers", "WMI deletion loop crashed — process deletion monitoring stopped")
+            except Exception: pass
     threading.Thread(target=_creation_loop, daemon=True).start()
     threading.Thread(target=_deletion_loop, daemon=True).start()
     return True
@@ -681,6 +707,27 @@ def process_monitor():
                                     pattern_alerts[pk],
                                     "printui.exe outside System32 may indicate Tangerine Turkey malware.",
                                     exe_path=pexe)
+                        pk = (proc.pid, "vssadmin_delete")
+                        if pname == "vssadmin.exe" and pk not in pattern_alerts and "delete shadows" in cmdline_str:
+                            pattern_alerts[pk] = f"vssadmin.exe deleting shadow copies: {cmdline_str[:80]}"
+                            raise_alert("CRITICAL", "Ransomware",
+                                pattern_alerts[pk],
+                                "Shadow copy deletion is a hallmark ransomware precursor — vssadmin is being used to delete system backups.",
+                                exe_path=pexe)
+                        pk = (proc.pid, "wmic_delete")
+                        if pname == "wmic.exe" and pk not in pattern_alerts and "shadowcopy" in cmdline_str and "delete" in cmdline_str:
+                            pattern_alerts[pk] = f"wmic.exe deleting shadow copies: {cmdline_str[:80]}"
+                            raise_alert("CRITICAL", "Ransomware",
+                                pattern_alerts[pk],
+                                "Shadow copy deletion via WMIC is a hallmark ransomware precursor.",
+                                exe_path=pexe)
+                        pk = (proc.pid, "diskshadow")
+                        if pname == "diskshadow.exe" and pk not in pattern_alerts:
+                            pattern_alerts[pk] = f"diskshadow.exe running: {cmdline_str[:80]}"
+                            raise_alert("HIGH", "Ransomware",
+                                pattern_alerts[pk],
+                                "diskshadow execution may indicate ransomware activity (manipulates Volume Shadow Copy Service).",
+                                exe_path=pexe)
                         pk = (proc.pid, "rundll32_userdll")
                         if pname == "rundll32.exe" and pk not in pattern_alerts:
                             for part in cmdline_list:
@@ -730,7 +777,9 @@ def process_monitor():
                             resolve_alert("Suspicious Processes", msg)
                         except Exception:
                             pass
-            except Exception: pass
+            except Exception:
+                try: log_error("watchers", "process_monitor crashed — polling process detection stopped")
+                except Exception: pass
         time.sleep(1)
 
 CRYPTO_PATTERNS = ["1A1z","3J98","bc1q","0x","T9yD","r3GYT"]
@@ -760,11 +809,13 @@ def clipboard_monitor(root):
                         flagged = True
                         score_event("clipboard_crypto", "Clipboard",
                             "Possible crypto address in clipboard — verify it hasn't been swapped",
-                            detail=f"Value starts with: {current[:20]}...")
+                                        detail=f"Value starts with: {current[:20]}...")
                     elif not is_crypto and flagged:
                         flagged = False
                         resolve_alert("Clipboard","Possible crypto address in clipboard — verify it hasn't been swapped")
-            except Exception: pass
+            except Exception:
+                try: log_error("watchers", "clipboard_monitor failed")
+                except Exception: pass
         time.sleep(2)
 
 def get_reg_run_entries():
@@ -1103,7 +1154,8 @@ def powershell_spawn_monitor():
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
                     pass
         except Exception:
-            pass
+            try: log_error("watchers", "powershell_spawn_monitor crashed")
+            except Exception: pass
         alive = {p.pid for p in psutil.process_iter(['pid'])}
         seen = {(pid, p) for (pid, p) in seen if pid in alive}
 
@@ -1481,7 +1533,8 @@ def wallet_monitor():
                             "process reading it is a classic stealer behavior.")
             seen_open = open_now
         except Exception:
-            pass
+            try: log_error("watchers", "wallet_monitor crashed")
+            except Exception: pass
 
 def _proc_running(names):
     try:
@@ -1542,7 +1595,8 @@ def avkill_monitor():
                             "detection.")
             seen = current
         except Exception:
-            pass
+            try: log_error("watchers", "avkill_monitor crashed")
+            except Exception: pass
 
 
 def _dark_titlebar(win):
