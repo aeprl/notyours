@@ -31,6 +31,32 @@ real-time local session stealer detector for windows.
 - useful to use alongside [Farbar Recovery Scan Tool (FRST)](https://www.bleepingcomputer.com/download/farbar-recovery-scan-tool/) to add suspicious processes / registry edits to fixlist
 - you can either run it straight through a python compiler or build it as an exe through build.bat
 
+## scoring engine
+
+- alerts are scored cumulatively per executable
+- once a score passes a threshold, the engine automatically responds:
+
+<center>
+
+| threshold   |      action      |
+|----------|:-------------:|
+| ≥ 80      | suspend process |
+| ≥ 100     | kill process |
+| ≥ 80 + outbound connection | block IP via Windows Firewall |
+
+</center>
+
+- when multiple low-severity indicators (unsigned_drop + outbound_connection) target the same process, they will accumulate and escalate the response level.
+
+## running
+- you can run notyours directly by running the built.bat file, going to \dist\notyours, and running notyours.exe
+- or you can run it using powershell (sessions logged in notyours.log):
+```cmd
+python detector.py              # GUI mode
+python detector.py cli          # commandline mode
+
+```
+
 ## disclaimer
 
 - notyours does not actively delete ANY detection and is only used for alerts
