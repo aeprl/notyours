@@ -35,16 +35,31 @@ real-time local session stealer detector for windows.
 
 - alerts are scored cumulatively per executable
 - once a score passes a threshold, the engine automatically responds:
-
-<center>
-
-| threshold   |      action      |
-|----------|:-------------:|
-| ≥ 80      | suspend process |
-| ≥ 100     | kill process |
-| ≥ 80 + outbound connection | block IP via Windows Firewall |
-
-</center>
+  
+<div align="center">
+  <table border="1">
+    <thead>
+      <tr>
+        <th>threshold</th>
+        <th>action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>≥ 80</td>
+        <td align="center">suspend process</td>
+      </tr>
+      <tr>
+        <td>≥ 100</td>
+        <td align="center">kill process</td>
+      </tr>
+      <tr>
+        <td>≥ 80 + outbound connection</td>
+        <td align="center">block IP via Windows Firewall</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
 
 - when multiple low-severity indicators (unsigned_drop + outbound_connection) target the same process, they will accumulate and escalate the response level.
 
