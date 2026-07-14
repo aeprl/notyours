@@ -24,3 +24,4 @@ __pycache__/
 /memory
 test_detections.py
 notyours_dpg.py
+notyours.log
