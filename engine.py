@@ -268,7 +268,7 @@ def process_lineage_check(exe_path):
                         return -20
                     if pname in PSPAWN_SUSPICIOUS_PARENTS:
                         return 25
-                    if pexe and not verify_signature(pexe):
+                    if pexe and verify_signature(pexe) != "Valid":
                         return 15
                     return 5
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -383,10 +383,6 @@ def verify_signature(path):
                      ("fdwRevocationChecks", ctypes.c_ulong),
                      ("dwUnionChoice", ctypes.c_ulong),
                      ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)),
-                     ("pCatalog", ctypes.c_void_p),
-                     ("pBlob", ctypes.c_void_p),
-                     ("pSponsor", ctypes.c_void_p),
-                     ("pWinPEntry", ctypes.c_void_p),
                      ("dwStateAction", ctypes.c_ulong),
                      ("hWVTStateData", ctypes.c_void_p),
                      ("pwszURLReference", ctypes.c_wchar_p),

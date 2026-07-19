@@ -1,11 +1,16 @@
 import os, sys, time, json, re, threading, subprocess
-import shutil, tempfile, winreg, hashlib
+import shutil, tempfile, winreg
 import psutil
 from pathlib import Path
-from ctypes import wintypes
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from engine import *
+
+try:
+    import win32clipboard
+    _HAS_CLIPBOARD = True
+except ImportError:
+    _HAS_CLIPBOARD = False
 
 BROWSER_PROFILE_PATHS = {
     "Chrome":  Path(os.environ.get("LOCALAPPDATA","")) / "Google/Chrome/User Data/Default",
@@ -56,8 +61,6 @@ TEMP_WATCH_DIRS = [d for d in [
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Temp"),
 ] if d and os.path.isdir(d)]
 
-REG_POLL_INTERVAL    = 30
-DEFENDER_POLL_INTERVAL = 30
 DNS_POLL_INTERVAL    = 120
 DNS_SPIKE_MIN    = 15
 DNS_SPIKE_FACTOR = 2.5
@@ -111,8 +114,7 @@ WALLET_BENIGN = {"chrome.exe","msedge.exe","firefox.exe","brave.exe",
                   "dllhost.exe","svchost.exe","searchui.exe",
                   "shellexperiencehost.exe","runtimebroker.exe",
                   "applicationframehost.exe","onedrive.exe","dropbox.exe",
-                  "discord.exe"}
-WALLET_OPEN_POLL = 15
+                   "discord.exe"}
 
 def _is_wallet_path(path):
     low = path.lower()
@@ -134,7 +136,6 @@ AV_TOOLS = {"avastui.exe","avastsvc.exe","afwserv.exe","wireshark.exe",
             "nortonsecurity.exe","mcshield.exe","bdagent.exe","kaspersky.exe",
             "f-secure.exe","ekrn.exe","avgui.exe","sophosui.exe","defender.exe",
             "securityhealthsystray.exe"}
-AV_POLL = 10
 
 WHITELIST_BUILTIN_TASKS = True
 
@@ -596,191 +597,6 @@ def start_wmi_process_monitor():
     threading.Thread(target=_deletion_loop, daemon=True).start()
     return True
 
-def process_monitor():
-    seen = set()
-    seen_py = set()
-    py_alert_msgs = {}
-    pattern_alerts = {}
-    while True:
-        if MONITOR_ENABLED["process"]:
-            try:
-                active_now = set()
-                for proc in psutil.process_iter(['pid','name','exe']):
-                    try:
-                        pname = (proc.info['name'] or "").lower()
-                        if proc.pid == os.getpid():
-                            continue
-                        pexe = proc.info.get('exe') or ""
-                        try:
-                            if pexe and os.path.normcase(pexe) == os.path.normcase(sys.executable):
-                                continue
-                        except Exception:
-                            pass
-                        try:
-                            parent = proc.parent()
-                            ppname = parent.name().lower() if parent else ""
-                        except Exception:
-                            ppname = ""
-                        try:
-                            cmdline_list = proc.cmdline()
-                            cmdline_str = " ".join(cmdline_list).lower()
-                        except Exception:
-                            cmdline_list = []
-                            cmdline_str = ""
-                        if pname in SUSPICIOUS_OUTBOUND_PROCESSES:
-                            try:
-                                conns = proc.net_connections(kind='inet')
-                            except Exception:
-                                conns = []
-                            for conn in conns:
-                                if conn.status == 'ESTABLISHED' and conn.raddr:
-                                    key = (proc.pid, conn.raddr.ip, conn.raddr.port)
-                                    active_now.add(key)
-                                    if key not in seen:
-                                        seen.add(key)
-                                        raise_alert("HIGH","Suspicious Network",
-                                            f"{proc.info['name']} (PID {proc.pid}) → {conn.raddr.ip}:{conn.raddr.port}",
-                                            "Suspicious process making outbound connection.",
-                                            exe_path=pexe)
-                                    score_event("outbound_connection", "Suspicious Network",
-                                        f"{proc.info['name']} (PID {proc.pid}) → {conn.raddr.ip}:{conn.raddr.port}",
-                                        exe_path=pexe)
-                        if _is_suspicious_python(pname, pexe):
-                            pn = ppname
-                            level, reason = _python_alert_level(pn, pexe)
-                            key = (proc.pid, pexe.lower())
-                            if key not in seen_py:
-                                seen_py.add(key)
-                                py_alert_msgs[key] = (pname, pexe)
-                                raise_alert(level, "Suspicious Processes",
-                                    f"Python interpreter '{pname}' running from {pexe}",
-                                    reason, exe_path=pexe)
-                        pk = (proc.pid, "msiexec_remote")
-                        if pname == "msiexec.exe" and pk not in pattern_alerts:
-                            for part in cmdline_list:
-                                pl = part.lower()
-                                if pl.startswith(("http://", "https://")):
-                                    pattern_alerts[pk] = f"msiexec.exe downloading remote MSI: {part[:60]}"
-                                    raise_alert("HIGH", "Suspicious Processes",
-                                        pattern_alerts[pk],
-                                        "Remote MSI execution is used by Scarlet Goldfinch, Raspberry Robin.",
-                                        exe_path=pexe)
-                                    break
-                        pk = (proc.pid, "curl_script")
-                        if pname in ("curl.exe","curl") and pk not in pattern_alerts:
-                            for part in cmdline_list:
-                                pl = part.lower()
-                                if any(pl.endswith(ext) for ext in (".bat",".ps1",".vbs",".cmd",".jse",".js")):
-                                    pattern_alerts[pk] = f"curl.exe downloading script: {part[:60]}"
-                                    raise_alert("HIGH", "Suspicious Processes",
-                                        pattern_alerts[pk],
-                                        "curl downloading scripts is a common MintsLoader download cradle.",
-                                        exe_path=pexe)
-                                    break
-                        pk = (proc.pid, "nltest_recon")
-                        if pname == "nltest.exe" and pk not in pattern_alerts and "/domain_trusts" in cmdline_str:
-                            pattern_alerts[pk] = "nltest.exe domain trust reconnaissance"
-                            raise_alert("HIGH", "Suspicious Processes",
-                                pattern_alerts[pk],
-                                "nltest /domain_trusts is a SocGholish ransomware precursor for lateral movement.",
-                                exe_path=pexe)
-                        pk = (proc.pid, "schtasks_rundll32")
-                        if pname == "schtasks.exe" and pk not in pattern_alerts and "/create" in cmdline_str and "rundll32" in cmdline_str:
-                            pattern_alerts[pk] = f"schtasks.exe creating scheduled task with rundll32: {cmdline_str[:80]}"
-                            raise_alert("CRITICAL", "Suspicious Processes",
-                                pattern_alerts[pk],
-                                "schtasks /create with rundll32 is the exact CleanUpLoader persistence signature.",
-                                exe_path=pexe)
-                        pk = (proc.pid, "client32_padata")
-                        if pname == "client32.exe" and pk not in pattern_alerts and pexe and "programdata" in pexe.lower():
-                            pattern_alerts[pk] = f"NetSupport Manager client32.exe running from {pexe}"
-                            raise_alert("CRITICAL", "Suspicious Processes",
-                                pattern_alerts[pk],
-                                "client32.exe from non-ProgramFiles indicates NetSupport Manager abused as RAT.",
-                                exe_path=pexe)
-                        pk = (proc.pid, "printui_abnormal")
-                        if pname == "printui.exe" and pk not in pattern_alerts and pexe:
-                            sys32 = os.path.normcase(r"C:\Windows\System32")
-                            if not os.path.normcase(pexe).startswith(sys32):
-                                pattern_alerts[pk] = f"printui.exe running from non-standard path: {pexe}"
-                                raise_alert("HIGH", "Suspicious Processes",
-                                    pattern_alerts[pk],
-                                    "printui.exe outside System32 may indicate Tangerine Turkey malware.",
-                                    exe_path=pexe)
-                        pk = (proc.pid, "vssadmin_delete")
-                        if pname == "vssadmin.exe" and pk not in pattern_alerts and "delete shadows" in cmdline_str:
-                            pattern_alerts[pk] = f"vssadmin.exe deleting shadow copies: {cmdline_str[:80]}"
-                            raise_alert("CRITICAL", "Ransomware",
-                                pattern_alerts[pk],
-                                "Shadow copy deletion is a hallmark ransomware precursor — vssadmin is being used to delete system backups.",
-                                exe_path=pexe)
-                        pk = (proc.pid, "wmic_delete")
-                        if pname == "wmic.exe" and pk not in pattern_alerts and "shadowcopy" in cmdline_str and "delete" in cmdline_str:
-                            pattern_alerts[pk] = f"wmic.exe deleting shadow copies: {cmdline_str[:80]}"
-                            raise_alert("CRITICAL", "Ransomware",
-                                pattern_alerts[pk],
-                                "Shadow copy deletion via WMIC is a hallmark ransomware precursor.",
-                                exe_path=pexe)
-                        pk = (proc.pid, "diskshadow")
-                        if pname == "diskshadow.exe" and pk not in pattern_alerts:
-                            pattern_alerts[pk] = f"diskshadow.exe running: {cmdline_str[:80]}"
-                            raise_alert("HIGH", "Ransomware",
-                                pattern_alerts[pk],
-                                "diskshadow execution may indicate ransomware activity (manipulates Volume Shadow Copy Service).",
-                                exe_path=pexe)
-                        pk = (proc.pid, "rundll32_userdll")
-                        if pname == "rundll32.exe" and pk not in pattern_alerts:
-                            for part in cmdline_list:
-                                clean_part = part.strip('"\'')
-                                if clean_part.lower().endswith(".dll") and _is_exe_from_user_writable(clean_part):
-                                    pattern_alerts[pk] = f"rundll32.exe loading DLL from user-writable path: {clean_part[:60]}"
-                                    raise_alert("HIGH", "Suspicious Processes",
-                                        pattern_alerts[pk],
-                                        "rundll32 loading a DLL from AppData/Temp indicates CleanUpLoader DLL sideloading.",
-                                        exe_path=pexe)
-                                    break
-                        pk = (proc.pid, "node_userwritable")
-                        if pname == "node.exe" and pk not in pattern_alerts and _is_exe_from_user_writable(pexe):
-                            pattern_alerts[pk] = f"Node.js interpreter running from user-writable path: {pexe}"
-                            raise_alert("HIGH", "Suspicious Processes",
-                                pattern_alerts[pk],
-                                "node.exe from AppData/Temp may indicate Tampered Chef or Mocha Manakin stealer.",
-                                exe_path=pexe)
-                        pk = (proc.pid, "explorer_cmd_pasterun")
-                        if pname == "cmd.exe" and pk not in pattern_alerts and ppname == "explorer.exe" and "start" in cmdline_str and "exit" in cmdline_str:
-                            pattern_alerts[pk] = "cmd.exe spawned by explorer.exe with paste-and-run pattern"
-                            raise_alert("HIGH", "Suspicious Processes",
-                                pattern_alerts[pk],
-                                "explorer.exe → cmd.exe with 'start' + 'exit' is the exact KongTuke paste-and-run analytic.",
-                                exe_path=pexe)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied): pass
-                for key in seen - active_now:
-                    pid, ip, port = key
-                    resolve_alert("Suspicious Network", f"PID {pid} → {ip}:{port}")
-                seen = active_now
-                alive = {p.pid for p in psutil.process_iter(['pid'])}
-                old_seen_py = set(seen_py)
-                seen_py = {k for k in seen_py if k[0] in alive}
-                gone_py = old_seen_py - seen_py
-                for key in gone_py:
-                    pname, pexe = py_alert_msgs.pop(key, (None, None))
-                    if pname and pexe:
-                        msg = f"Python interpreter '{pname}' running from {pexe}"
-                        try:
-                            resolve_alert("Suspicious Processes", msg)
-                        except Exception:
-                            pass
-                for pk in list(pattern_alerts):
-                    if pk[0] not in alive:
-                        msg = pattern_alerts.pop(pk)
-                        try:
-                            resolve_alert("Suspicious Processes", msg)
-                        except Exception:
-                            pass
-            except Exception:
-                try: log_error("watchers", "process_monitor crashed — polling process detection stopped")
-                except Exception: pass
-        time.sleep(1)
 
 CRYPTO_PATTERNS = ["1A1z","3J98","bc1q","0x","T9yD","r3GYT"]
 
@@ -790,15 +606,17 @@ def clipboard_monitor(root):
         if MONITOR_ENABLED["clipboard"]:
             try:
                 if root is None:
-                    import win32clipboard
-                    try:
-                        win32clipboard.OpenClipboard()
+                    if _HAS_CLIPBOARD:
                         try:
-                            current = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-                        except TypeError:
+                            win32clipboard.OpenClipboard()
+                            try:
+                                current = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                            except TypeError:
+                                current = ""
+                            win32clipboard.CloseClipboard()
+                        except Exception:
                             current = ""
-                        win32clipboard.CloseClipboard()
-                    except Exception:
+                    else:
                         current = ""
                 else:
                     current = root.clipboard_get()
@@ -837,27 +655,6 @@ def get_reg_run_entries():
             pass
     return found
 
-def registry_run_monitor():
-    known = get_reg_run_entries()
-    if MONITOR_ENABLED["registry"]:
-        for (label, subkey, name), value in known.items():
-            raise_reg_run(label, subkey, name, value)
-    while True:
-        time.sleep(REG_POLL_INTERVAL)
-        if not MONITOR_ENABLED["registry"]:
-            known = get_reg_run_entries()
-            continue
-        current = get_reg_run_entries()
-        for key, value in current.items():
-            if key not in known:
-                label, subkey, name = key
-                raise_reg_run(label, subkey, name, value)
-        for key in list(known):
-            if key not in current:
-                label, subkey, name = key
-                resolve_alert("Registry Run Key",
-                             f"Run-key entry '{name}' in {label}\\{subkey}")
-        known = current
 
 KNOWN_GOOD_RUN = {
     "onedrive", "discord", "steam", "spotify", "adobe", "googleupdate",
@@ -996,24 +793,6 @@ def get_defender_exclusions():
         pass
     return found
 
-def defender_exclusion_monitor():
-    known = get_defender_exclusions()
-    while True:
-        time.sleep(DEFENDER_POLL_INTERVAL)
-        if not MONITOR_ENABLED["defender"]:
-            known = get_defender_exclusions()
-            continue
-        current = get_defender_exclusions()
-        for name, value in current.items():
-            if name not in known:
-                raise_alert("CRITICAL", "Defender Exclusion",
-                            f"New Defender exclusion path: {name}",
-                            f"Value: {value} (malware adds exclusions to evade scanning)")
-        for name in list(known):
-            if name not in current:
-                resolve_alert("Defender Exclusion",
-                             f"New Defender exclusion path: {name}")
-        known = current
 
 def archiver_running():
     try:
@@ -1109,55 +888,6 @@ def dns_monitor():
             alerted = False
             resolve_alert("DNS Anomaly", DNS_MSG)
 
-def powershell_spawn_monitor():
-    MONITORED_CHILDREN = {"powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe"}
-    seen = set()
-    while True:
-        time.sleep(5)
-        if not MONITOR_ENABLED["pspawn"]:
-            seen.clear()
-            continue
-        try:
-            for proc in psutil.process_iter(['pid', 'name']):
-                try:
-                    child_name = (proc.info['name'] or "").lower()
-                    if child_name not in MONITORED_CHILDREN:
-                        continue
-                    ppid = proc.ppid()
-                    if ppid == os.getpid():
-                        continue
-                    parent = psutil.Process(ppid) if ppid else None
-                    pname = (parent.name().lower() if parent else "")
-                    try:
-                        if parent and (parent.exe() or "") and \
-                                os.path.normcase(parent.exe()) == os.path.normcase(sys.executable):
-                            continue
-                    except Exception:
-                        pass
-                    if child_name in ("powershell.exe", "pwsh.exe") and pname in PSPAWN_SUSPICIOUS_PARENTS:
-                        key = (proc.pid, pname)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        raise_alert("HIGH", "PowerShell Spawn",
-                                    f"PowerShell (PID {proc.pid}) spawned by {pname}",
-                                    "Office/browser/mshta spawning PowerShell is a classic "
-                                    "fake-CAPTCHA / macro delivery chain.")
-                    elif child_name in ("wscript.exe", "cscript.exe", "mshta.exe") and pname in TRUSTED_BROWSER_EXES:
-                        key = (proc.pid, pname)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        raise_alert("HIGH", "PowerShell Spawn",
-                                    f"{child_name} (PID {proc.pid}) spawned by browser {pname}",
-                                    "Browser spawning wscript/cscript/mshta is the classic SocGholish fake update chain.")
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
-                    pass
-        except Exception:
-            try: log_error("watchers", "powershell_spawn_monitor crashed")
-            except Exception: pass
-        alive = {p.pid for p in psutil.process_iter(['pid'])}
-        seen = {(pid, p) for (pid, p) in seen if pid in alive}
 
 def _snapshot_integrity():
     snap = {"run": {}, "startup": {}, "typelib": []}
@@ -1190,32 +920,6 @@ def save_baseline(snap):
     except Exception:
         pass
 
-def integrity_monitor():
-
-    baseline = load_baseline()
-    if baseline is None:
-        save_baseline(_snapshot_integrity())
-        baseline = load_baseline() or {"run": {}, "startup": {}}
-    while True:
-        time.sleep(REG_POLL_INTERVAL)
-        if not MONITOR_ENABLED["integrity"]:
-            baseline = _snapshot_integrity()
-            continue
-        current = _snapshot_integrity()
-        for rk, val in current["run"].items():
-            if rk in baseline["run"] and baseline["run"][rk] != val:
-                raise_alert("HIGH", "Run-Key Integrity",
-                            f"Run-key value changed: {rk}",
-                            f"Old: {baseline['run'][rk]}\nNew: {val}\n"
-                            "A stealer may have overwritten an existing entry to masquerade.")
-        for sf, h in current["startup"].items():
-            if sf in baseline["startup"] and baseline["startup"][sf] != h:
-                raise_alert("HIGH", "Startup Integrity",
-                            f"Startup item modified: {os.path.basename(sf)}",
-                            f"Hash changed (old {baseline['startup'][sf][:12]} → "
-                            f"new {h[:12]}) — possible tampering.")
-        baseline = current
-        save_baseline(baseline)
 
 class ExtensionHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -1316,30 +1020,6 @@ def get_typelib_entries():
         pass
     return found
 
-def typelib_monitor():
-    baseline = load_baseline() or {}
-    tl_base = baseline.get("typelib")
-    if tl_base is None:
-        tl_base = list(get_typelib_entries().keys())
-        baseline["typelib"] = tl_base
-        save_baseline(baseline)
-    known = set(tl_base)
-    while True:
-        time.sleep(DEFENDER_POLL_INTERVAL)
-        if not MONITOR_ENABLED["typelib"]:
-            known = set(get_typelib_entries().keys())
-            continue
-        current = set(get_typelib_entries().keys())
-        for name in current - known:
-            raise_alert("HIGH", "TypeLib Hijack",
-                        f"New TypeLib entry: {name}",
-                        "HKCU\\Software\\Classes\\TypeLib modification is an "
-                        "emerging infostealer persistence / hijack technique.")
-        known = current
-        baseline = load_baseline() or {}
-        baseline["typelib"] = list(known)
-        save_baseline(baseline)
-
 def _wait_reg_change(hive, subkey, watch_subtree=True):
     """Block until registry key changes (native RegNotifyChangeKeyValue via ctypes)."""
     from ctypes import WinDLL, wintypes, get_last_error
@@ -1388,10 +1068,12 @@ def _reg_run_watcher():
                 raise_reg_run(label, subkey, name, value)
             except Exception:
                 pass
+    reg_run_lock = threading.Lock()
     for hive, label, sk in REG_RUN_KEYS:
-        def check(k=known):
+        def check():
             nonlocal known
-            known = _run_key_check(known)
+            with reg_run_lock:
+                known = _run_key_check(known)
         threading.Thread(target=_watch_reg_key_loop,
                          args=(hive, sk, label, check), daemon=True).start()
 
@@ -1430,27 +1112,29 @@ def _integrity_watcher():
         baseline["startup"] = {}
     known_run = get_reg_run_entries()
     known_tl = set(get_typelib_entries().keys())
+    integrity_lock = threading.Lock()
     def check_run():
         nonlocal baseline, known_run
-        if not MONITOR_ENABLED["integrity"]:
-            baseline = _snapshot_integrity()
-            known_run = get_reg_run_entries()
-            return
-        current = _snapshot_integrity()
-        for rk, val in current["run"].items():
-            if rk in baseline["run"] and baseline["run"][rk] != val:
-                raise_alert("HIGH", "Run-Key Integrity",
-                            f"Run-key value changed: {rk}",
-                            f"Old: {baseline['run'][rk]}\nNew: {val}\n"
-                            "A stealer may have overwritten an existing entry to masquerade.")
-        for sf, h in current["startup"].items():
-            if sf in baseline["startup"] and baseline["startup"][sf] != h:
-                raise_alert("HIGH", "Startup Integrity",
-                            f"Startup item modified: {os.path.basename(sf)}",
-                            f"Hash changed (old {baseline['startup'][sf][:12]} \u2192 "
-                            f"new {h[:12]}) \u2014 possible tampering.")
-        baseline = current
-        save_baseline(baseline)
+        with integrity_lock:
+            if not MONITOR_ENABLED["integrity"]:
+                baseline = _snapshot_integrity()
+                known_run = get_reg_run_entries()
+                return
+            current = _snapshot_integrity()
+            for rk, val in current["run"].items():
+                if rk in baseline["run"] and baseline["run"][rk] != val:
+                    raise_alert("HIGH", "Run-Key Integrity",
+                                f"Run-key value changed: {rk}",
+                                f"Old: {baseline['run'][rk]}\nNew: {val}\n"
+                                "A stealer may have overwritten an existing entry to masquerade.")
+            for sf, h in current["startup"].items():
+                if sf in baseline["startup"] and baseline["startup"][sf] != h:
+                    raise_alert("HIGH", "Startup Integrity",
+                                f"Startup item modified: {os.path.basename(sf)}",
+                                f"Hash changed (old {baseline['startup'][sf][:12]} \u2192 "
+                                f"new {h[:12]}) \u2014 possible tampering.")
+            baseline = current
+            save_baseline(baseline)
         known_run = get_reg_run_entries()
     def check_tl():
         nonlocal baseline, known_tl
@@ -1505,36 +1189,6 @@ def start_registry_monitors():
     _integrity_watcher()
     _typelib_watcher()
 
-def wallet_monitor():
-    seen_open = set()
-    while True:
-        time.sleep(WALLET_OPEN_POLL)
-        if not MONITOR_ENABLED["wallet"]:
-            seen_open.clear(); continue
-        try:
-            open_now = set()
-            for proc in psutil.process_iter(['pid','name']):
-                try:
-                    pname = (proc.info['name'] or "").lower()
-                    if pname in WALLET_BENIGN:
-                        continue
-                    for of in proc.open_files():
-                        if _is_wallet_path(of.path):
-                            open_now.add((proc.info['pid'], pname, of.path))
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
-                    pass
-            for key in open_now - seen_open:
-                pid, pname, fp = key
-                raise_alert("HIGH", "Wallet Access",
-                            f"{pname} (PID {pid}) opened wallet file: "
-                            f"{os.path.basename(fp)}",
-                            "Crypto wallet data should only be touched by the "
-                            "browser/extension it belongs to. A non-browser "
-                            "process reading it is a classic stealer behavior.")
-            seen_open = open_now
-        except Exception:
-            try: log_error("watchers", "wallet_monitor crashed")
-            except Exception: pass
 
 def _proc_running(names):
     try:
@@ -1571,64 +1225,3 @@ class ScreenshotHandler(FileSystemEventHandler):
                         "windows; unexpected bitmaps in temp may indicate theft.")
         except Exception:
             pass
-
-def avkill_monitor():
-    seen = {}
-    while True:
-        time.sleep(AV_POLL)
-        if not MONITOR_ENABLED["avkill"]:
-            seen.clear(); continue
-        try:
-            current = {}
-            for proc in psutil.process_iter(['pid','name']):
-                try:
-                    n = (proc.info['name'] or "").lower()
-                    if n in AV_TOOLS:
-                        current.setdefault(n, set()).add(proc.info['pid'])
-                except (psutil.NoSuchProcess, psutil.Error):
-                    pass
-            for name in set(seen) - set(current):
-                raise_alert("HIGH", "AV Kill Attempt",
-                            f"Security/analysis tool disappeared: {name}",
-                            "Snake and similar stealers terminate AV / analysis "
-                            "tools (avastui.exe, wireshark.exe, …) to evade "
-                            "detection.")
-            seen = current
-        except Exception:
-            try: log_error("watchers", "avkill_monitor crashed")
-            except Exception: pass
-
-
-def _dark_titlebar(win):
-
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
-        dwmapi = ctypes.windll.dwmapi
-        hwnd = int(win.winfo_id())
-
-        try:
-            root = user32.GetAncestor(hwnd, 2)
-            if root: hwnd = root
-        except Exception:
-            pass
-
-        try:
-            uxtheme = ctypes.windll.uxtheme
-            if hasattr(uxtheme, "SetPreferredAppMode"):
-                uxtheme.SetPreferredAppMode(2)
-            if hasattr(uxtheme, "AllowDarkModeForWindow"):
-                uxtheme.AllowDarkModeForWindow(hwnd, True)
-        except Exception:
-            pass
-        val = ctypes.c_int(1)
-        for attr in (20, 19):
-            try:
-                dwmapi.DwmSetWindowAttribute(hwnd, attr,
-                                             ctypes.byref(val), ctypes.sizeof(val))
-            except Exception:
-                pass
-    except Exception:
-        pass
