@@ -253,6 +253,18 @@ def _active_response(total, indicator, exe_path, extra):
             pass
 
 
+def _is_user_writable_path(path):
+    if not path:
+        return False
+    pl = path.lower()
+    for v in ("APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "USERPROFILE"):
+        d = os.environ.get(v, "")
+        if d:
+            d = d.rstrip("\\").lower()
+            if pl.startswith(d):
+                return True
+    return False
+
 def process_lineage_check(exe_path):
     if not exe_path:
         return 0
@@ -261,18 +273,23 @@ def process_lineage_check(exe_path):
         for proc in psutil.process_iter(["pid", "name", "exe"]):
             try:
                 if proc.exe() and os.path.normpath(proc.exe()).lower() == target:
-                    parent = proc.parent()
-                    if parent is None:
-                        return 0
-                    pname = parent.name().lower()
-                    pexe = parent.exe().lower() if parent.exe() else ""
-                    if pname in TRUSTED_PARENTS:
-                        return -20
-                    if pname in PSPAWN_SUSPICIOUS_PARENTS:
-                        return 25
-                    if pexe and verify_signature(pexe) != "Valid":
-                        return 15
-                    return 5
+                    curr = proc
+                    score = 0
+                    for depth in range(4):
+                        parent = curr.parent()
+                        if parent is None:
+                            break
+                        pname = parent.name().lower()
+                        pexe = parent.exe() if parent.exe() else ""
+                        if pname in PSPAWN_SUSPICIOUS_PARENTS:
+                            score = max(score, 25)
+                        elif pexe and _is_user_writable_path(pexe):
+                            if verify_signature(pexe) != "Valid":
+                                score = max(score, 15)
+                        if depth == 0 and pname in TRUSTED_PARENTS:
+                            return -20
+                        curr = parent
+                    return score
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
     except Exception:
@@ -364,7 +381,14 @@ def resolve_alert(category, message):
         alert_callback("resolved", entry)
 
 
+_signature_cache = {}
+
 def verify_signature(path):
+    if not path or not os.path.isfile(path):
+        return None
+    h = hash_file(path)
+    if h and h in _signature_cache:
+        return _signature_cache[h]
     try:
         wintrust = ctypes.windll.wintrust
     except Exception:
@@ -413,11 +437,14 @@ def verify_signature(path):
         rc = wintrust.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(wtd))
     except Exception:
         return None
+    sig_status = "Unverified"
     if rc == 0:
-        return "Valid"
-    if (rc & 0xFFFFFFFF) == 0x800B0100:
-        return "NotSigned"
-    return "Unverified"
+        sig_status = "Valid"
+    elif (rc & 0xFFFFFFFF) == 0x800B0100:
+        sig_status = "NotSigned"
+    if h:
+        _signature_cache[h] = sig_status
+    return sig_status
 
 
 def hash_file(path):
@@ -429,3 +456,81 @@ def hash_file(path):
         return h.hexdigest()
     except Exception:
         return None
+
+
+def protect_process_dacl():
+    """
+    Apply a restrictive DACL to the current process handle via advapi32.
+    Denies PROCESS_TERMINATE and PROCESS_SUSPEND_RESUME to Everyone /
+    Builtin Users, leaving SYSTEM and Administrators unaffected.
+    Degrades gracefully if not running as Administrator.
+    """
+    if sys.platform != "win32":
+        return False
+
+    # Required access right bits
+    PROCESS_TERMINATE      = 0x0001
+    PROCESS_SUSPEND_RESUME = 0x0800
+    DENY_MASK              = PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME
+
+    # SE_ privilege / ACL constants
+    ACL_REVISION           = 2
+    ACCESS_DENIED_ACE_TYPE = 1
+    # Well-known SID: Builtin Everyone (S-1-1-0)
+    SECURITY_WORLD_SID_AUTHORITY = (ctypes.c_ubyte * 6)(0, 0, 0, 0, 0, 1)
+
+    try:
+        advapi32   = ctypes.windll.advapi32
+        kernel32   = ctypes.windll.kernel32
+
+        # ── 1. Create a SID for Everyone ─────────────────────────────────
+        class SID_IDENTIFIER_AUTHORITY(ctypes.Structure):
+            _fields_ = [("Value", ctypes.c_ubyte * 6)]
+
+        pSid = ctypes.c_void_p()
+        sia  = SID_IDENTIFIER_AUTHORITY()
+        for i, v in enumerate((0, 0, 0, 0, 0, 1)):
+            sia.Value[i] = v
+
+        if not advapi32.AllocateAndInitializeSid(
+            ctypes.byref(sia), 1,     # 1 sub-authority
+            0, 0, 0, 0, 0, 0, 0, 0,  # sub-authorities (only [0]=0 used)
+            ctypes.byref(pSid)
+        ):
+            return False
+
+        try:
+            # ── 2. Build an ACL with a single DENY ACE ───────────────────
+            acl_size = 1024
+            acl_buf  = (ctypes.c_byte * acl_size)()
+            pAcl     = ctypes.cast(acl_buf, ctypes.c_void_p)
+
+            if not advapi32.InitializeAcl(pAcl, acl_size, ACL_REVISION):
+                return False
+
+            if not advapi32.AddAccessDeniedAce(pAcl, ACL_REVISION, DENY_MASK, pSid):
+                return False
+
+            # ── 3. Build a SECURITY_DESCRIPTOR containing our ACL ────────
+            SD_SIZE = 20   # SECURITY_DESCRIPTOR_MIN_LENGTH on 32/64-bit
+            sd_buf  = (ctypes.c_byte * 256)()
+            pSD     = ctypes.cast(sd_buf, ctypes.c_void_p)
+
+            if not advapi32.InitializeSecurityDescriptor(pSD, 1):  # SECURITY_DESCRIPTOR_REVISION=1
+                return False
+
+            if not advapi32.SetSecurityDescriptorDacl(pSD, True, pAcl, False):
+                return False
+
+            # ── 4. Apply to the current process ──────────────────────────
+            hProc = kernel32.GetCurrentProcess()
+            DACL_SECURITY_INFORMATION = 0x00000004
+            ret = advapi32.SetKernelObjectSecurity(hProc, DACL_SECURITY_INFORMATION, pSD)
+            return bool(ret)
+
+        finally:
+            advapi32.FreeSid(pSid)
+
+    except Exception:
+        return False
+

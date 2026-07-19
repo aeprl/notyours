@@ -64,7 +64,7 @@ real-time local session stealer detector for windows.
 - when multiple low-severity indicators (unsigned_drop + outbound_connection) target the same process, they will accumulate and escalate the response level.
 
 ## running
-- you can run notyours directly by running the built.bat file, going to \dist\notyours, and running notyours.exe
+- you can run notyours directly by running the built.bat file, going to \dist\notyours, and running notyours.exe (elevated is recommended)
 - or you can run it using powershell (sessions logged in notyours.log):
 ```cmd
 python detector.py              # GUI mode

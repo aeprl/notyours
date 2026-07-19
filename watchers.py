@@ -200,13 +200,85 @@ def is_builtin_task(name):
                "adobe","nvidia","intel","amd","realtek"
            ])
 
+import ctypes
+from ctypes import wintypes
+
+class RM_UNIQUE_PROCESS(ctypes.Structure):
+    _fields_ = [
+        ("dwProcessId", wintypes.DWORD),
+        ("ProcessStartTime", wintypes.FILETIME)
+    ]
+
+class RM_PROCESS_INFO(ctypes.Structure):
+    _fields_ = [
+        ("Process", RM_UNIQUE_PROCESS),
+        ("strAppName", wintypes.WCHAR * 256),
+        ("strServiceShortName", wintypes.WCHAR * 64),
+        ("ApplicationType", ctypes.c_int),
+        ("AppStatus", wintypes.DWORD),
+        ("TSSessionId", wintypes.DWORD),
+        ("bRestartable", wintypes.BOOL)
+    ]
+
+try:
+    _rstrtmgr = ctypes.WinDLL('rstrtmgr', use_last_error=True)
+    _rstrtmgr.RmStartSession.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, wintypes.WCHAR * 33]
+    _rstrtmgr.RmStartSession.restype = wintypes.DWORD
+    _rstrtmgr.RmRegisterResources.argtypes = [wintypes.DWORD, wintypes.UINT, ctypes.POINTER(wintypes.LPCWSTR), wintypes.UINT, ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p]
+    _rstrtmgr.RmRegisterResources.restype = wintypes.DWORD
+    _rstrtmgr.RmGetList.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT), ctypes.POINTER(RM_PROCESS_INFO), ctypes.POINTER(wintypes.DWORD)]
+    _rstrtmgr.RmGetList.restype = wintypes.DWORD
+    _rstrtmgr.RmEndSession.argtypes = [wintypes.DWORD]
+    _rstrtmgr.RmEndSession.restype = wintypes.DWORD
+    _HAS_RSTRTMGR = True
+except Exception:
+    _HAS_RSTRTMGR = False
+
+def get_processes_holding_file(file_path):
+    if not _HAS_RSTRTMGR:
+        return []
+    session_handle = wintypes.DWORD(0)
+    session_key = (wintypes.WCHAR * 33)()
+    res = _rstrtmgr.RmStartSession(ctypes.byref(session_handle), 0, session_key)
+    if res != 0:
+        return []
+    try:
+        file_paths_arr = (wintypes.LPCWSTR * 1)(file_path)
+        res = _rstrtmgr.RmRegisterResources(session_handle, 1, file_paths_arr, 0, None, 0, None)
+        if res != 0:
+            return []
+        proc_info_needed = wintypes.UINT(0)
+        proc_info_count = wintypes.UINT(0)
+        reboot_reasons = wintypes.DWORD(0)
+        res = _rstrtmgr.RmGetList(session_handle, ctypes.byref(proc_info_needed), ctypes.byref(proc_info_count), None, ctypes.byref(reboot_reasons))
+        if res != 0 and res != 234: # 234 is ERROR_MORE_DATA
+            return []
+        if proc_info_needed.value == 0:
+            return []
+        proc_info_count.value = proc_info_needed.value
+        proc_infos = (RM_PROCESS_INFO * proc_info_count.value)()
+        res = _rstrtmgr.RmGetList(session_handle, ctypes.byref(proc_info_needed), ctypes.byref(proc_info_count), proc_infos, ctypes.byref(reboot_reasons))
+        if res != 0:
+            return []
+        pids = []
+        for i in range(proc_info_count.value):
+            pids.append(proc_infos[i].Process.dwProcessId)
+        return pids
+    except Exception:
+        return []
+    finally:
+        try:
+            _rstrtmgr.RmEndSession(session_handle)
+        except Exception:
+            pass
+
 PROCESS_QUERY_INFORMATION = 0x0400
 
 _open_files_queue = []
 _open_files_lock  = threading.Lock()
 
 def _open_files_checker():
-    """Background thread: drain _open_files_queue and do the expensive open_files() check."""
+    """Background thread: drain _open_files_queue and do the optimized handle check."""
     while True:
         time.sleep(1)  
         with _open_files_lock:
@@ -221,18 +293,19 @@ def _open_files_checker():
                 continue
             seen_paths.add(fp_low)
             try:
-                for proc in psutil.process_iter(['pid','name','exe']):
+                pids = get_processes_holding_file(filepath)
+                for pid in pids:
+                    if pid == os.getpid():
+                        continue
                     try:
-                        pname = (proc.info['name'] or "").lower()
+                        proc = psutil.Process(pid)
+                        pname = (proc.name() or "").lower()
                         if pname in TRUSTED_BROWSER_EXES:
                             continue
-                        for f in proc.open_files():
-                            if fp_low in f.path.lower():
-                                raise_alert("HIGH","Browser Profile Access",
-                                    f"{proc.info['name']} (PID {proc.pid}) reading {Path(filepath).name}",
-                                    f"Browser: {browser_name} | EXE: {proc.info.get('exe','unknown')}",
-                                    exe_path=proc.info.get('exe'))
-                                break
+                        raise_alert("HIGH", "Browser Profile Access",
+                                    f"{proc.name()} (PID {proc.pid}) reading {Path(filepath).name}",
+                                    f"Browser: {browser_name} | EXE: {proc.exe() or 'unknown'}",
+                                    exe_path=proc.exe())
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
             except Exception:
@@ -462,13 +535,32 @@ def self_defense():
 def _check_wmi_new_process(p):
     """Handle a WMI Win32_Process creation event."""
     try:
-        pid = p.ProcessId
-        name = p.Name
-        exe_path = p.ExecutablePath
-        cmdline = p.CommandLine or ""
-        ppid = p.ParentProcessId
-        if not name or not exe_path:
+        pid = getattr(p, "ProcessID", None)
+        if pid is None:
+            pid = getattr(p, "ProcessId", None)
+        name = getattr(p, "ProcessName", None)
+        if name is None:
+            name = getattr(p, "Name", None)
+        ppid = getattr(p, "ParentProcessID", None)
+        if ppid is None:
+            ppid = getattr(p, "ParentProcessId", None)
+        if pid is None or not name:
             return
+        exe_path = getattr(p, "ExecutablePath", None)
+        cmdline = getattr(p, "CommandLine", None)
+        if cmdline is None:
+            cmdline = ""
+        if not exe_path or not cmdline:
+            try:
+                proc = psutil.Process(pid)
+                if not exe_path:
+                    exe_path = proc.exe()
+                if not cmdline:
+                    cmdline = " ".join(proc.cmdline())
+            except Exception:
+                pass
+        if not exe_path:
+            exe_path = name
         nl = name.lower()
         el = exe_path.lower()
         if nl in ("powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe"):
@@ -544,10 +636,13 @@ def _check_wmi_new_process(p):
 def _check_wmi_deleted_process(p):
     """Handle a WMI Win32_Process deletion event — AV kill detection."""
     try:
-        name = p.Name.lower() if p.Name else ""
+        name = getattr(p, "ProcessName", None)
+        if name is None:
+            name = getattr(p, "Name", None)
+        name = name.lower() if name else ""
         if name in AV_TOOLS:
             score_event("self_defense_trigger","AV Kill Attempt",
-                f"AV process terminated: {p.Name}",
+                f"AV process terminated: {name}",
                 detail="An antimalware or analysis tool process was stopped. "
                        "This may indicate a kill-switch by infostealer malware.")
     except Exception:
@@ -581,8 +676,8 @@ def start_wmi_process_monitor():
         return False
     def _creation_loop():
         try:
-            watcher = c.watch_for(notification_type="Creation",
-                                  wmi_class="Win32_Process", delay_secs=1)
+            # Win32_ProcessStartTrace provides instant process creation events with zero polling overhead
+            watcher = c.watch_for(raw_wql="SELECT * FROM Win32_ProcessStartTrace")
             while True:
                 _check_wmi_new_process(watcher())
         except Exception:
@@ -590,8 +685,8 @@ def start_wmi_process_monitor():
             except Exception: pass
     def _deletion_loop():
         try:
-            watcher = c.watch_for(notification_type="Deletion",
-                                  wmi_class="Win32_Process", delay_secs=1)
+            # Win32_ProcessStopTrace provides instant process deletion events with zero polling overhead
+            watcher = c.watch_for(raw_wql="SELECT * FROM Win32_ProcessStopTrace")
             while True:
                 _check_wmi_deleted_process(watcher())
         except Exception:

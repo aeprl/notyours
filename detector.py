@@ -269,14 +269,14 @@ def _cached_icon(kind, color="#bdbdbd"):
     if key in _ICON_PHOTOS:
         return _ICON_PHOTOS[key]
     try:
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageDraw, ImageTk
         img = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         def r(x1,y1,x2,y2): return d.rectangle((x1,y1,x2,y2), outline=color, width=1)
         def l(x1,y1,x2,y2): return d.line((x1,y1,x2,y2), fill=color, width=1)
         def o(x1,y1,x2,y2): return d.ellipse((x1,y1,x2,y2), outline=color, width=1)
-        def p(*pts): return d.polygon(pts, outline=color, width=1)
-        def a(x1,y1,x2,y2,s,e): return d.arc((x1,y1,x2,y2), s, e, fill=color, width=1)
+        def p(pts): return d.polygon(pts, outline=color, width=1)
+        def draw_arc(x1,y1,x2,y2,s,e): return d.arc((x1,y1,x2,y2), s, e, fill=color, width=1)
         if kind == "folder":
             p((2,5,6,5,8,3,14,3,14,13,2,13))
         elif kind == "wmi":
@@ -285,7 +285,7 @@ def _cached_icon(kind, color="#bdbdbd"):
         elif kind == "calendar":
             r(3,4,13,13); l(3,6,13,6); l(5,2,5,4); l(11,2,11,4)
         elif kind == "process":
-            o(4,3,9,8); a(3,7,11,15,180,180); o(10,9,14,13); l(14,13,16,15)
+            o(4,3,9,8); draw_arc(3,7,11,15,180,180); o(10,9,14,13); l(14,13,16,15)
         elif kind == "clipboard":
             r(4,5,12,14); r(6,3,10,5); l(6,8,10,8); l(6,11,10,11)
         elif kind == "reg":
@@ -331,10 +331,6 @@ class AlertTable:
         self.columns = columns
         self.rows = []
         self.row_by_id = {}
-        self.frame_map = {}
-        self._dsx = 0; self._dsw = 0
-        self._relayout_job = None
-        self._last_msg_width = sum(c["width"] for c in columns if c["key"] == "message")
         self._build()
 
     def _build(self):
@@ -346,205 +342,100 @@ class AlertTable:
                         troughcolor="#1b1b1b", bordercolor="#1b1b1b",
                         arrowcolor="#9a9a9a", gripcount=0, width=11)
             s.map("Dark.Vertical.TScrollbar", background=[("active","#4a4a4a")])
+            s.configure("Alert.Treeview", background=ROW_BG, foreground=TEXT,
+                       fieldbackground=ROW_BG, rowheight=26,
+                       font=("Segoe UI",8), borderwidth=0)
+            s.map("Alert.Treeview",
+                 background=[("selected", SELECT_BG)],
+                 foreground=[("selected", TEXT)])
+            s.configure("Alert.Treeview.Heading", background=HEADER_BG,
+                       foreground="#9a9a9a", font=("Segoe UI",8),
+                       borderwidth=0, relief="flat")
+            s.map("Alert.Treeview.Heading", background=[("active", "#2a2a2a")])
+            s.layout("Alert.Treeview", [("Alert.Treeview.treearea", {"sticky": "nswe"})])
             AlertTable._style_done = True
-        self.outer = tk.Frame(self.parent, bg=BG)
-        self.header = tk.Frame(self.outer, bg=HEADER_BG, height=26)
-        self.header.pack(fill="x")
-        self._build_header()
-        self.canvas = tk.Canvas(self.outer, bg=ROW_BG, highlightthickness=0)
-        self.sb = ttk.Scrollbar(self.outer, orient="vertical", style="Dark.Vertical.TScrollbar",
-                                command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.sb.set)
-        self.body = tk.Frame(self.canvas, bg=ROW_BG)
-        self.body.configure(width=self._total())
-        self.body.pack_propagate(False)
-        self.canvas.create_window((0,0), window=self.body, anchor="nw")
-        self.canvas.pack(side="left", fill="both", expand=True)
+        self.outer = tk.Frame(self.parent, bg=BG, highlightthickness=0)
+        display_cols = [c["key"] for c in self.columns if c["key"] != "sel"]
+        col_labels = {c["key"]: c["label"] for c in self.columns}
+        col_widths = {c["key"]: c["width"] for c in self.columns}
+        col_minws = {c["key"]: c.get("minw", 20) for c in self.columns}
+        self.tree = ttk.Treeview(self.outer, columns=display_cols,
+                                show="tree headings",
+                                style="Alert.Treeview",
+                                selectmode="extended",
+                                takefocus=False)
+        self.tree.column("#0", width=22, minwidth=22, stretch=False)
+        for cid in display_cols:
+            self.tree.heading(cid, text=col_labels.get(cid, ""))
+            should_stretch = cid in ("message", "category")
+            self.tree.column(cid, width=col_widths.get(cid, 100),
+                            minwidth=col_minws.get(cid, 20),
+                            stretch=should_stretch)
+        sb = ttk.Scrollbar(self.outer, orient="vertical", style="Dark.Vertical.TScrollbar",
+                           command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure("row_even", background=ROW_ALT)
+        self.tree.tag_configure("row_odd", background=ROW_BG)
+        self.tree.tag_configure("checkable", foreground="#9a9ad0")
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<ButtonRelease-1>", self._on_click_hash)
+        self.tree.bind("<Motion>", self._on_motion)
+        self.tree.bind("<Leave>", lambda e: self._hide_tip())
+        self._tip = None
+        self._iid_map = {}
 
-        self._scroll_job = None
-        self.canvas.bind("<Configure>", lambda e: self._schedule_scroll())
-
-    def _total(self):
-        return sum(c["width"] for c in self.columns)
-
-    def _build_header(self):
-        for ch in list(self.header.children.values()): ch.destroy()
-        self._hdr = []
-        x = 0
-        for i, c in enumerate(self.columns):
-            lbl = tk.Label(self.header, text=c["label"], bg=HEADER_BG, fg="#9a9a9a",
-                           font=("Segoe UI",8), anchor="w")
-            lbl.place(x=x+6, y=0, width=max(1, c["width"]-6), height=26)
-            sep = None
-            if c.get("resizable"):
-                sep = tk.Frame(self.header, bg="#333333", cursor="sb_h_double_arrow", width=6)
-                sep.place(x=x+c["width"]-3, y=4, width=6, height=18)
-                sep.bind("<ButtonPress-1>", lambda e, idx=i: self._start_drag(e, idx))
-                sep.bind("<B1-Motion>", lambda e, idx=i: self._do_drag(e, idx))
-                sep.bind("<Enter>", lambda e, s=sep: s.config(bg="#555555"))
-                sep.bind("<Leave>", lambda e, s=sep: s.config(bg="#333333"))
-            self._hdr.append((c, lbl, sep))
-            x += c["width"]
-        self.header.configure(width=self._total())
-
-    def _start_drag(self, e, idx):
-        self._dsx = e.x_root; self._dsw = self.columns[idx]["width"]
-
-    def _do_drag(self, e, idx):
-        dw = e.x_root - self._dsx
-        self.columns[idx]["width"] = max(self.columns[idx]["minw"], self._dsw + dw)
-        self._deferred_relayout()
-
-    def _deferred_relayout(self):
-        if self._relayout_job is not None:
-            self.app.after_cancel(self._relayout_job)
-        self._relayout_job = self.app.after(50, self._relayout)
-
-    def _relayout(self):
-        self._relayout_job = None
-        self.body.configure(width=self._total())
-        self.body.configure(height=max(1, len(self.rows) * 26))
-
-        x = 0
-        for c, lbl, sep in getattr(self, "_hdr", []):
-            lbl.place(x=x+6, y=0, width=max(1, c["width"]-6), height=26)
-            if sep is not None:
-                sep.place(x=x+c["width"]-3, y=4, width=6, height=18)
-            x += c["width"]
-        for r in self.rows:
-            self._position_row(r)
-        msg_w = sum(c["width"] for c in self.columns if c["key"] == "message")
-        if msg_w != self._last_msg_width:
-            self._last_msg_width = msg_w
-            for r in self.rows:
-                self._fit_message(r)
-        self._update_scrollbar()
-
-    def _schedule_scroll(self):
-        if self._scroll_job is not None:
-            self.app.after_cancel(self._scroll_job)
-        self._scroll_job = self.app.after(40, self._update_scrollbar)
-
-    def _update_scrollbar(self):
-        try:
-            content_h = len(self.rows) * 26
-
-            self.body.configure(height=content_h)
-            view = self.canvas.winfo_height()
-            self.canvas.configure(scrollregion=(0, 0, self._total(), content_h))
-            if content_h > view + 1:
-                if not self.sb.winfo_ismapped():
-                    self.sb.pack(side="right", fill="y")
-            else:
-
-                self.canvas.yview_moveto(0.0)
-                if self.sb.winfo_ismapped():
-                    self.sb.pack_forget()
-        except Exception:
+    def _on_click_hash(self, e):
+        iid = self.tree.identify_row(e.y)
+        col = self.tree.identify_column(e.x)
+        ci = int(col[1:]) if col and col[1:].isdigit() else -1
+        dcols = [c["key"] for c in self.columns if c["key"] != "sel"]
+        if not iid or not (0 <= ci < len(dcols) and dcols[ci] == "hash"):
             return
-
-    def add_row(self, entry, past=False):
-        frame = tk.Frame(self.body, bg=ROW_BG, height=26)
-        frame.pack(fill="x")
-        row = {"entry":entry,"frame":frame,"cells":{},"bgw":[frame],"icons":[],"selected":False}
-        self.frame_map[id(frame)] = row
-        sel = tk.Label(frame, text="☐", bg=ROW_BG, fg=TEXT, font=("Segoe UI",9), cursor="hand2")
-        row["cells"]["sel"] = sel
-        lf = tk.Frame(frame, bg=ROW_BG)
-        color = LEVEL_COLORS.get(entry["level"], "#aaaaaa")
-        dot = tk.Label(lf, text="●", bg=ROW_BG, fg=color, font=("Segoe UI",9))
-        lt = tk.Label(lf, text=entry["level"], bg=ROW_BG, fg=TEXT, font=("Segoe UI",8,"bold"))
-        dot.pack(side="left", padx=(2,3)); lt.pack(side="left")
-        row["cells"]["level"] = lf
-        row["bgw"] += [lf, dot, lt]
-        cf = tk.Frame(frame, bg=ROW_BG)
-        kind = CATEGORY_ICON.get(entry["category"], "folder")
-        icon_photo = _cached_icon(kind)
-        if icon_photo:
-            ic = tk.Label(cf, image=icon_photo, bg=ROW_BG)
-        else:
-            ic = tk.Canvas(cf, width=16, height=16, bg=ROW_BG, highlightthickness=0)
-            draw_icon(ic, kind, "#bdbdbd")
-        ic.pack(side="left", padx=(2,4))
-        cat = tk.Label(cf, text=entry["category"], bg=ROW_BG, fg="#cfcfcf", font=("Segoe UI",8))
-        cat.pack(side="left")
-        row["cells"]["category"] = cf
-        row["bgw"] += [cf, ic]
-        m = tk.Label(frame, text=entry["message"], bg=ROW_BG, fg=TEXT, font=("Segoe UI",8), anchor="w")
-        row["cells"]["message"] = m; row["bgw"].append(m)
-        def _on_row_double(e, r=row):
-            cat = r["entry"].get("category", "")
-            rp = r["entry"].get("reg_path")
-            dd = r["entry"].get("drop_dir")
-            if rp:
-                self.app._open_regedit(rp)
-            elif dd:
-                self.app._open_folder(dd)
-        frame.bind("<Double-1>", _on_row_double)
-        m.bind("<Double-1>", _on_row_double)
-        def _on_enter(e, r=row): self._show_tip(r, e)
-        def _on_leave(e): self._hide_tip()
-        frame.bind("<Enter>", _on_enter)
-        frame.bind("<Leave>", _on_leave)
-        vt = tk.Label(frame, text=entry.get("vt_status") or "–", bg=ROW_BG, fg=DIM, font=("Segoe UI",8))
-        row["cells"]["vt"] = vt; row["bgw"].append(vt)
-
+        row_data = self._iid_map.get(iid)
+        if not row_data:
+            return
+        entry = row_data["entry"]
         exe_path = entry.get("exe_path")
-        is_exe_process = (entry.get("category") == "Suspicious Processes"
-                          and exe_path and os.path.isfile(exe_path))
-        if is_exe_process:
-            hb = tk.Button(frame, text="Check", bg="#222230", fg="#9a9ad0", font=("Segoe UI",7),
-                           relief="flat", padx=4, command=lambda e=entry: self.app._vt_click(e))
-            row["cells"]["hash"] = hb; row["bgw"].append(hb)
-        else:
-            hb = tk.Button(frame, text="Check", bg="#1b1b1f", fg="#4a4a4a", font=("Segoe UI",7),
-                           relief="flat", padx=4, state="disabled", cursor="arrow")
-            row["cells"]["hash"] = hb; row["bgw"].append(hb)
-        if past:
-            status = "dismissed" if entry.get("dismissed") else "auto-resolved"
-            t = tk.Label(frame, text=f"✓ {status}", bg=ROW_BG, fg="#7fcf9a", font=("Segoe UI",8))
-        else:
-            t = tk.Label(frame, text=entry["time"], bg=ROW_BG, fg=DIM, font=("Segoe UI",8))
-        row["cells"]["time"] = t; row["bgw"].append(t)
-        def _on_row_click(e, r=row):
-            self._toggle(r)
+        if exe_path and os.path.isfile(exe_path):
+            self.app._vt_click(entry)
 
-        row["cells"]["sel"].bind("<Button-1>", _on_row_click)
-        for w in row["cells"].values():
-            try:
-                if isinstance(w, tk.Button):
-                    continue
-            except Exception:
-                pass
-        self.rows.append(row)
-        self.row_by_id[entry["id"]] = row
-        self._position_row(row)
-        self._fit_message(row)
-        self.body.configure(height=max(1, len(self.rows) * 26))
-        self.app.after(0, self._update_scrollbar)
-        parity = len(self.rows) % 2
-        self._set_row_bg(row, ROW_ALT if parity else ROW_BG)
+    def _on_double_click(self, e):
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return
+        row_data = self._iid_map.get(iid)
+        if not row_data:
+            return
+        entry = row_data["entry"]
+        col = self.tree.identify_column(e.x)
+        ci = int(col[1:]) if col and col[1:].isdigit() else -1
+        dcols = [c["key"] for c in self.columns if c["key"] != "sel"]
+        rp = entry.get("reg_path")
+        dd = entry.get("drop_dir")
+        if rp:
+            self.app._open_regedit(rp)
+        elif dd:
+            self.app._open_folder(dd)
 
-    def _position_row(self, row):
-        x = 0
-        for c in self.columns:
-            widget = row["cells"].get(c["key"])
-            if widget:
-                widget.place(x=x, y=0, width=c["width"], height=26)
-            x += c["width"]
-
-    def _fit_message(self, row):
-        w = next((c["width"] for c in self.columns if c["key"] == "message"), 380)
-        maxc = max(4, (w - 12) // 6)
-        msg = row["entry"]["message"]
-        if len(msg) > maxc:
-            row["cells"]["message"].config(text=msg[:maxc-1] + "…")
-        else:
-            row["cells"]["message"].config(text=msg)
-
-    def _show_tip(self, row, e):
+    def _on_motion(self, e):
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            self._hide_tip()
+            return
+        col = self.tree.identify_column(e.x)
+        ci = int(col[1:]) if col and col[1:].isdigit() else -1
+        dcols = [c["key"] for c in self.columns if c["key"] != "sel"]
+        if 0 <= ci < len(dcols) and dcols[ci] == "message":
+            row_data = self._iid_map.get(iid)
+            if row_data:
+                self._show_tip(row_data["entry"], e)
+                return
         self._hide_tip()
-        entry = row["entry"]
+
+    def _show_tip(self, entry, e):
+        self._hide_tip()
         text = entry["message"]
         if entry.get("detail"):
             text = text + "\n\n" + entry["detail"]
@@ -562,47 +453,69 @@ class AlertTable:
             except Exception: pass
             self._tip = None
 
-    def _set_row_bg(self, row, color):
-        for w in row["bgw"]:
-            try:
-                if isinstance(w, tk.Canvas):
-                    w.config(bg=color)
-                else:
-                    w.config(bg=color)
-            except Exception:
-                pass
-
-    def _toggle(self, row):
-        self._set_selected(row, not row["selected"])
-        self.app._on_selection_changed()
-
-    def _set_selected(self, row, val):
-        row["selected"] = val
-        row["cells"]["sel"].config(text="☑" if val else "☐")
-        parity = (self.rows.index(row) % 2)
-        color = SELECT_BG if val else (ROW_ALT if parity else ROW_BG)
-        self._set_row_bg(row, color)
-
-    def select_all(self, val):
-        for r in self.rows:
-            self._set_selected(r, val)
-
-    def get_selected(self):
-        return [r["entry"] for r in self.rows if r["selected"]]
+    def add_row(self, entry, past=False):
+        kind = CATEGORY_ICON.get(entry.get("category", ""), "folder")
+        photo = _cached_icon(kind)
+        is_checkable = (entry.get("category") == "Suspicious Processes" and
+                       entry.get("exe_path") and os.path.isfile(entry["exe_path"]))
+        hash_text = "Check" if is_checkable else ""
+        time_text = entry["time"]
+        if past:
+            time_text = "✓ " + ("dismissed" if entry.get("dismissed") else "auto-resolved")
+        values = [
+            f"● {entry['level']}",
+            entry.get("category", ""),
+            entry.get("message", ""),
+            entry.get("vt_status", "–") or "–",
+            hash_text,
+            time_text,
+        ]
+        parity = len(self.rows) % 2
+        tag = "row_even" if parity else "row_odd"
+        iid = str(entry["id"])
+        tags = [tag]
+        if is_checkable:
+            tags.append("checkable")
+        kwargs = {"values": values, "tags": tuple(tags)}
+        if photo is not None:
+            kwargs["image"] = photo
+        self.tree.insert("", "end", iid=iid, **kwargs)
+        row = {"id": entry["id"], "iid": iid, "entry": entry}
+        self.rows.append(row)
+        self.row_by_id[entry["id"]] = row
+        self._iid_map[iid] = row
 
     def remove_row(self, entry):
-        r = self.row_by_id.pop(entry["id"], None)
-        if not r: return
-        r["frame"].destroy()
-        if r in self.rows: self.rows.remove(r)
-        self.frame_map.pop(id(r["frame"]), None)
-        self.body.configure(height=max(1, len(self.rows) * 26))
-        self.app.after(0, self._update_scrollbar)
+        iid = str(entry["id"])
+        try:
+            self.tree.delete(iid)
+        except Exception:
+            return
+        self._iid_map.pop(iid, None)
+        self.row_by_id.pop(entry["id"], None)
+        self.rows = [r for r in self.rows if r["id"] != entry["id"]]
+
+    def select_all(self, val):
+        if val:
+            self.tree.selection_set(self.tree.get_children())
+        else:
+            self.tree.selection_set([])
+
+    def get_selected(self):
+        result = []
+        for iid in self.tree.selection():
+            r = self._iid_map.get(iid)
+            if r:
+                result.append(r["entry"])
+        return result
 
     def update_vt(self, entry):
         r = self.row_by_id.get(entry["id"])
         if r:
-            r["cells"]["vt"].config(text=(entry.get("vt") or "–")[:40])
+            try:
+                self.tree.set(r["iid"], "vt", (entry.get("vt") or "–")[:40])
+            except Exception:
+                pass
 
 def _dark_titlebar(win):
 
@@ -617,6 +530,14 @@ def _dark_titlebar(win):
         try:
             root = user32.GetAncestor(hwnd, 2)
             if root: hwnd = root
+        except Exception:
+            pass
+
+        try:
+            GWL_STYLE = -16
+            WS_CLIPCHILDREN = 0x02000000
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+            user32.SetWindowLongW(hwnd, GWL_STYLE, style | WS_CLIPCHILDREN)
         except Exception:
             pass
 
@@ -664,6 +585,10 @@ class DetectorApp(tk.Tk):
 
         self._build_ui()
         engine.alert_callback = self._on_alert_event
+
+        # Harden own process and start watchdog
+        engine.protect_process_dacl()
+        _launch_watchdog()
 
         self.tray_icon     = None
         self._in_tray      = False
@@ -997,7 +922,7 @@ class DetectorApp(tk.Tk):
         return self.past_table if self.showing_past else self.active_table
 
     def _on_wheel(self, event):
-        self._current_table().canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        self._current_table().tree.yview_scroll(int(-1*(event.delta/120)), "units")
         return "break"
 
     def _toggle_all_monitors(self):
@@ -1217,6 +1142,23 @@ def _headless_callback(event_type, entry):
     except Exception:
         pass
 
+def _launch_watchdog():
+    """Spawn the watchdog companion in a detached process."""
+    try:
+        companion = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog_companion.py")
+        if getattr(sys, "frozen", False):
+            companion = os.path.join(os.path.dirname(sys.executable), "watchdog_companion.py")
+        if not os.path.isfile(companion):
+            return
+        detector_target = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+        subprocess.Popen(
+            [sys.executable, companion, str(os.getpid()), detector_target],
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            close_fds=True,
+        )
+    except Exception:
+        pass
+
 def run_headless(mode="headless (service)"):
     """Start all monitors without Tkinter GUI. Blocks until stop signal."""
     _log_session_start(mode)
@@ -1229,6 +1171,12 @@ def run_headless(mode="headless (service)"):
     print(f"Logging to: {_LOG_PATH}")
     print("-" * 50)
     print()
+    # Harden the process: deny TERMINATE/SUSPEND to standard users
+    dacl_ok = engine.protect_process_dacl()
+    if dacl_ok:
+        print("Process DACL protected (terminate/suspend denied to standard users).")
+    # Spawn watchdog companion to restart us if killed
+    _launch_watchdog()
     engine.alert_callback = _headless_callback
     observers = start_file_watchers()
     start_wmi_process_monitor()
