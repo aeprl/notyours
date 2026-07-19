@@ -5,6 +5,7 @@ from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from engine import *
+import engine
 
 try:
     import win32clipboard
@@ -154,6 +155,8 @@ def load_config():
             VT_API_KEY = cfg["vt_api_key"]
         if "whitelist_builtin_tasks" in cfg:
             WHITELIST_BUILTIN_TASKS = bool(cfg["whitelist_builtin_tasks"])
+        if "notifications_enabled" in cfg:
+            engine.NOTIFICATIONS_ENABLED = bool(cfg["notifications_enabled"])
         if "monitor_enabled" in cfg and isinstance(cfg["monitor_enabled"], dict):
             for k in MONITOR_ENABLED:
                 if k in cfg["monitor_enabled"]:
@@ -166,7 +169,8 @@ def save_config():
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump({"vt_api_key": VT_API_KEY,
                        "whitelist_builtin_tasks": WHITELIST_BUILTIN_TASKS,
-                       "monitor_enabled": dict(MONITOR_ENABLED)}, f)
+                       "monitor_enabled": dict(MONITOR_ENABLED),
+                       "notifications_enabled": engine.NOTIFICATIONS_ENABLED}, f)
     except Exception:
         pass
 

@@ -63,6 +63,8 @@ MONITOR_ENABLED = {"browser": True, "wmi": True, "tasks": True,
     "drop": True, "typelib": True,
     "wallet": True, "screenshot": True, "avkill": True}
 
+NOTIFICATIONS_ENABLED = True
+
 MONITOR_CATEGORIES = [
     ("browser",   "Browser Profiles"), ("wmi", "WMI Subscriptions"),
     ("tasks", "Scheduled Tasks"), ("process", "Suspicious Processes"),

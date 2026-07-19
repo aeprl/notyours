@@ -262,6 +262,65 @@ def draw_icon(c, kind, color, angle=0):
         c.create_line(11,5,5,11, fill=color, width=w)
 
 
+_ICON_PHOTOS = {}
+
+def _cached_icon(kind, color="#bdbdbd"):
+    key = (kind, color)
+    if key in _ICON_PHOTOS:
+        return _ICON_PHOTOS[key]
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        def r(x1,y1,x2,y2): return d.rectangle((x1,y1,x2,y2), outline=color, width=1)
+        def l(x1,y1,x2,y2): return d.line((x1,y1,x2,y2), fill=color, width=1)
+        def o(x1,y1,x2,y2): return d.ellipse((x1,y1,x2,y2), outline=color, width=1)
+        def p(*pts): return d.polygon(pts, outline=color, width=1)
+        def a(x1,y1,x2,y2,s,e): return d.arc((x1,y1,x2,y2), s, e, fill=color, width=1)
+        if kind == "folder":
+            p((2,5,6,5,8,3,14,3,14,13,2,13))
+        elif kind == "wmi":
+            o(5,5,11,11)
+            for a_ in range(0,360,45): import math as m; cx=cy=8; r_=m.radians(a_); l(cx,cy,cx+m.cos(r_)*6,cy+m.sin(r_)*6)
+        elif kind == "calendar":
+            r(3,4,13,13); l(3,6,13,6); l(5,2,5,4); l(11,2,11,4)
+        elif kind == "process":
+            o(4,3,9,8); a(3,7,11,15,180,180); o(10,9,14,13); l(14,13,16,15)
+        elif kind == "clipboard":
+            r(4,5,12,14); r(6,3,10,5); l(6,8,10,8); l(6,11,10,11)
+        elif kind == "reg":
+            r(3,4,12,14); l(3,7,12,7); l(7,4,7,14); o(11,9,15,13)
+        elif kind == "startup":
+            p((2,5,6,5,8,3,14,3,14,13,2,13)); l(8,4,8,10); l(5,7,11,7)
+        elif kind == "shield":
+            p((8,2,14,5,14,10,8,15,2,10,2,5)); l(8,5,8,11)
+        elif kind == "archive":
+            r(3,4,13,14); l(3,8,13,8); l(6,4,6,14); l(10,4,10,14)
+        elif kind == "dns":
+            o(3,3,13,13); l(8,3,8,13); l(3,8,13,8); l(4,5,12,11); l(4,11,12,5)
+        elif kind == "ps":
+            r(3,3,13,13); l(5,7,9,7); l(9,10,12,13)
+        elif kind == "integrity":
+            r(3,4,13,13); l(5,8,8,11); l(8,11,12,5)
+        elif kind == "extension":
+            r(4,4,12,12); r(10,2,14,6); r(2,10,6,14)
+        elif kind == "drop":
+            l(8,2,8,11); l(4,8,8,12); l(12,8,8,12); l(4,13,12,13)
+        elif kind == "typelib":
+            r(3,3,13,13); l(5,6,11,6); l(5,9,11,9); l(5,12,9,12)
+        elif kind == "wallet":
+            o(3,3,13,13); l(8,5,8,11); l(5,8,11,8)
+        elif kind == "screen":
+            r(3,3,13,12); l(6,12,10,12); l(8,12,8,14)
+        elif kind == "av":
+            p((8,2,14,5,14,10,8,15,2,10,2,5)); l(5,5,11,11); l(11,5,5,11)
+        photo = ImageTk.PhotoImage(img)
+        _ICON_PHOTOS[key] = photo
+        return photo
+    except Exception:
+        return None
+
+
 class AlertTable:
     """Resizable, custom-drawn alert table (Level shows a colored dot, rows turn
     vibrant blue when selected)."""
@@ -274,6 +333,8 @@ class AlertTable:
         self.row_by_id = {}
         self.frame_map = {}
         self._dsx = 0; self._dsw = 0
+        self._relayout_job = None
+        self._last_msg_width = sum(c["width"] for c in columns if c["key"] == "message")
         self._build()
 
     def _build(self):
@@ -332,9 +393,15 @@ class AlertTable:
     def _do_drag(self, e, idx):
         dw = e.x_root - self._dsx
         self.columns[idx]["width"] = max(self.columns[idx]["minw"], self._dsw + dw)
-        self._relayout()
+        self._deferred_relayout()
+
+    def _deferred_relayout(self):
+        if self._relayout_job is not None:
+            self.app.after_cancel(self._relayout_job)
+        self._relayout_job = self.app.after(50, self._relayout)
 
     def _relayout(self):
+        self._relayout_job = None
         self.body.configure(width=self._total())
         self.body.configure(height=max(1, len(self.rows) * 26))
 
@@ -346,6 +413,11 @@ class AlertTable:
             x += c["width"]
         for r in self.rows:
             self._position_row(r)
+        msg_w = sum(c["width"] for c in self.columns if c["key"] == "message")
+        if msg_w != self._last_msg_width:
+            self._last_msg_width = msg_w
+            for r in self.rows:
+                self._fit_message(r)
         self._update_scrollbar()
 
     def _schedule_scroll(self):
@@ -387,12 +459,17 @@ class AlertTable:
         row["bgw"] += [lf, dot, lt]
         cf = tk.Frame(frame, bg=ROW_BG)
         kind = CATEGORY_ICON.get(entry["category"], "folder")
-        ic = tk.Canvas(cf, width=16, height=16, bg=ROW_BG, highlightthickness=0)
-        draw_icon(ic, kind, "#bdbdbd"); ic.pack(side="left", padx=(2,4))
+        icon_photo = _cached_icon(kind)
+        if icon_photo:
+            ic = tk.Label(cf, image=icon_photo, bg=ROW_BG)
+        else:
+            ic = tk.Canvas(cf, width=16, height=16, bg=ROW_BG, highlightthickness=0)
+            draw_icon(ic, kind, "#bdbdbd")
+        ic.pack(side="left", padx=(2,4))
         cat = tk.Label(cf, text=entry["category"], bg=ROW_BG, fg="#cfcfcf", font=("Segoe UI",8))
         cat.pack(side="left")
         row["cells"]["category"] = cf
-        row["bgw"] += [cf, ic]; row["icons"].append(ic)
+        row["bgw"] += [cf, ic]
         m = tk.Label(frame, text=entry["message"], bg=ROW_BG, fg=TEXT, font=("Segoe UI",8), anchor="w")
         row["cells"]["message"] = m; row["bgw"].append(m)
         def _on_row_double(e, r=row):
@@ -442,6 +519,7 @@ class AlertTable:
         self.rows.append(row)
         self.row_by_id[entry["id"]] = row
         self._position_row(row)
+        self._fit_message(row)
         self.body.configure(height=max(1, len(self.rows) * 26))
         self.app.after(0, self._update_scrollbar)
         parity = len(self.rows) % 2
@@ -454,7 +532,6 @@ class AlertTable:
             if widget:
                 widget.place(x=x, y=0, width=c["width"], height=26)
             x += c["width"]
-        self._fit_message(row)
 
     def _fit_message(self, row):
         w = next((c["width"] for c in self.columns if c["key"] == "message"), 380)
@@ -487,11 +564,13 @@ class AlertTable:
 
     def _set_row_bg(self, row, color):
         for w in row["bgw"]:
-            try: w.config(bg=color)
-            except Exception: pass
-        for ic in row["icons"]:
-            try: ic.config(bg=color)
-            except Exception: pass
+            try:
+                if isinstance(w, tk.Canvas):
+                    w.config(bg=color)
+                else:
+                    w.config(bg=color)
+            except Exception:
+                pass
 
     def _toggle(self, row):
         self._set_selected(row, not row["selected"])
@@ -575,6 +654,7 @@ class DetectorApp(tk.Tk):
         self.showing_past = False
         self.stat_cards   = {}
         self.monitor_vars = {k: tk.BooleanVar(value=MONITOR_ENABLED[k]) for k in MONITOR_ENABLED}
+        self.notif_var = tk.BooleanVar(value=NOTIFICATIONS_ENABLED)
         self._cog_anim    = None
         self._settings_win = None
         self.logo_img = load_logo(34)
@@ -677,7 +757,8 @@ class DetectorApp(tk.Tk):
             pass
 
     def _notify(self, entry):
-
+        if not engine.NOTIFICATIONS_ENABLED:
+            return
         if entry.get("level") == "INFO":
             return
         if self.tray_icon is None:
@@ -833,6 +914,13 @@ class DetectorApp(tk.Tk):
                            activeforeground=TEXT, font=("Segoe UI",9)).pack(anchor="w", padx=16, pady=3)
         tk.Label(win, text="Disable a category to stop its alerts.",
                  bg=BG, fg=DIM2, font=("Segoe UI",8)).pack(padx=16, pady=(8,14))
+        tk.Label(win, text="Notifications", bg=BG, fg=TEXT,
+                 font=("Segoe UI",11,"bold")).pack(padx=16, pady=(4,2))
+        tk.Checkbutton(win, text="Show tray notifications on alert",
+                       variable=self.notif_var,
+                       command=self._set_notifications,
+                       bg=BG, fg=DIM, selectcolor=CARD_BG, activebackground=BG,
+                       activeforeground=TEXT, font=("Segoe UI",9)).pack(anchor="w", padx=16, pady=3)
         def _on_settings_close():
             if self._cog_anim is not None:
                 try: self.after_cancel(self._cog_anim)
@@ -845,6 +933,10 @@ class DetectorApp(tk.Tk):
 
     def _set_monitor(self, key):
         MONITOR_ENABLED[key] = self.monitor_vars[key].get()
+        save_config()
+
+    def _set_notifications(self):
+        engine.NOTIFICATIONS_ENABLED = self.notif_var.get()
         save_config()
 
     def _spin_cog(self, angle=0):
